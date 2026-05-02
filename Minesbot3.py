@@ -40,7 +40,7 @@ from aiogram.types import (
 # ============================================================================
 
 BOT_TOKEN   = "8680465230:AAFB-jpZf4xYMOTi4uMUGAI18_tdebqh9CY"
-ADMIN_IDS   = (853173723,)
+ADMIN_IDS = {853173723}
 DB_PATH     = os.getenv("DB_PATH", "casino.db")
 
 START_BONUS         = 1_000
