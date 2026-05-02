@@ -235,7 +235,7 @@ INSERT OR IGNORE INTO settings(key, value) VALUES
     ('min_bet', '10'),
     ('max_bet', '100000');
 INSERT OR IGNORE INTO message_templates(key, text) VALUES
-    ('start', 'Добро пожаловать в 💎 Diamond Mines Casino!\nСтартовый бонус: {bonus}'),
+    ('start', 'Добро пожаловать в 💎 Diamond Mines !\nСтартовый бонус: {bonus}'),
     ('help', '📖 Используй кнопки меню или текстовые команды.'),
     ('daily', '🎁 Ежедневный бонус: +{amount} 💎'),
     ('win', '🎉 Победа! +{win} 💎'),
@@ -876,7 +876,7 @@ async def cmd_start(m: Message, bot: Bot):
     tmpl = await get_setting("start_bonus", str(START_BONUS))
     bonus = float(tmpl)
     await m.answer(
-        f"🎰 <b>Добро пожаловать в Diamond Mines Casino!</b>\n\n"
+        f"🎰 <b>Добро пожаловать в Diamond Mines!</b>\n\n"
         f"💎 Стартовый бонус: <b>{fmt(bonus)}</b>\n"
         f"❓ Команды: /help",
         reply_markup=reply_kb(),
