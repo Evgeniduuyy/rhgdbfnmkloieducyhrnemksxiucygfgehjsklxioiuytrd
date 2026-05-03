@@ -23,7 +23,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("watchdog")
 
-BOT_SCRIPT          = "attached_assets/Minesbot3__1777789514092.py"
+BOT_SCRIPT          = "Minesbot3__1777789514092.py"
 BOT_TOKEN           = "8680465230:AAFB-jpZf4xYMOTi4uMUGAI18_tdebqh9CY"
 ADMIN_ID            = 853173723
 RESTART_DELAY       = 5
