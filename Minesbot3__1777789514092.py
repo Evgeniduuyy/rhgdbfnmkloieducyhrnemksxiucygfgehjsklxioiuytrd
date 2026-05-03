@@ -3199,7 +3199,11 @@ async def universal_handler(m: Message, bot: Bot):
             try: await status_msg.edit_text(f"✅ Рассылка завершена: {sent} доставлено, {failed} ошибок.")
             except Exception: pass
             return
-
+# Добавь это сразу после инициализации bot, но перед start_polling:
+try:
+    await bot.delete_webhook(drop_pending_updates=True)
+except Exception as e:
+    log.warning(f"delete_webhook error: {e}")
         if action == "shop_promo_apply":
             code = text.strip().upper()
             pc = await db_fetchone(
