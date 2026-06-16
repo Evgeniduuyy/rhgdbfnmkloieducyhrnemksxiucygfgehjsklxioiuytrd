@@ -187,28 +187,35 @@ async def _get_telethon_client() -> TelegramClient | None:
     return None
 
 
-async def check_peer_accessible(username: str) -> tuple[bool, str]:
+async def check_peer_accessible(username: str) -> tuple[bool, str, str]:
     """
-    Проверяет доступность и публичность канала/бота через Telethon.
-    Возвращает (ok, error_code).
-    error_code: 'private' | 'not_found' | '' (всё ок)
+    Проверяет доступность через Telethon и определяет тип сущности.
+    Возвращает (ok, error_code, entity_type).
+    error_code:   'private' | 'not_found' | '' (всё ок)
+    entity_type:  'channel' | 'group' | 'bot' | 'user' | ''
     """
     client = await _get_telethon_client()
     if client is None:
-        return True, ""  # нет сессий — пропускаем проверку
+        return True, "", ""  # нет сессий — пропускаем проверку
     try:
         entity = await client.get_entity(username)
-        # Проверяем публичность
         if isinstance(entity, Channel):
             if not entity.username:
-                return False, "private"
-        return True, ""
+                return False, "private", ""
+            etype = "group" if entity.megagroup else "channel"
+            return True, "", etype
+        elif isinstance(entity, User):
+            etype = "bot" if entity.bot else "user"
+            return True, "", etype
+        elif isinstance(entity, Chat):
+            return True, "", "group"
+        return True, "", ""
     except ChannelPrivateError:
-        return False, "private"
+        return False, "private", ""
     except (UsernameNotOccupiedError, UsernameInvalidError):
-        return False, "not_found"
+        return False, "not_found", ""
     except Exception:
-        return True, ""
+        return True, "", ""
     finally:
         try:
             await client.disconnect()
@@ -551,8 +558,11 @@ async def btn_report(message: Message, bot: Bot, state: FSMContext):
             remain = int(REPORT_COOLDOWN_SECONDS - (now - last).total_seconds())
             mins, secs = divmod(remain, 60)
             await message.answer(
-                f"⏳ Следующее обращение доступно через <b>{mins} мин. {secs} сек.</b>\n\n"
-                f"Это защита от злоупотреблений.",
+                f"⏳ <b>Кулдаун</b>\n\n"
+                f"Следующее обращение (любого типа) доступно через "
+                f"<b>{mins} мин. {secs} сек.</b>\n\n"
+                f"⏱ Ограничение 30 минут распространяется на все жалобы: "
+                f"сообщения, каналы, группы и боты.",
                 parse_mode="HTML"); return
         if not await db.has_active_subscription(uid):
             await message.answer("❌ Нет подписки:", reply_markup=await _buy_keyboard()); return
@@ -568,7 +578,8 @@ async def btn_report(message: Message, bot: Bot, state: FSMContext):
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💬 Сообщение / пост", callback_data="rtype:message")],
-            [InlineKeyboardButton(text="📢 Канал / группа",   callback_data="rtype:channel")],
+            [InlineKeyboardButton(text="📢 Канал",            callback_data="rtype:channel")],
+            [InlineKeyboardButton(text="👥 Группа",           callback_data="rtype:group")],
             [InlineKeyboardButton(text="🤖 Бот",              callback_data="rtype:bot")],
         ])
     )
@@ -588,14 +599,25 @@ async def cb_report_type(call: CallbackQuery, state: FSMContext):
     elif rtype == "channel":
         await state.set_state(States.waiting_peer_username)
         await call.message.edit_text(
-            "📢 <b>Жалоба на канал / группу</b>\n\n"
+            "📢 <b>Жалоба на канал</b>\n\n"
             "Отправьте @юзернейм или ссылку:\n"
-            "• <code>@durov</code>\n• <code>https://t.me/durov</code>",
+            "• <code>@durov</code>\n• <code>https://t.me/durov</code>\n\n"
+            "ℹ️ Тип (канал/группа/бот) будет определён автоматически.",
+            parse_mode="HTML")
+    elif rtype == "group":
+        await state.set_state(States.waiting_peer_username)
+        await call.message.edit_text(
+            "👥 <b>Жалоба на группу</b>\n\n"
+            "Отправьте @юзернейм или ссылку:\n"
+            "• <code>@mygroup</code>\n• <code>https://t.me/mygroup</code>\n\n"
+            "ℹ️ Тип (канал/группа/бот) будет определён автоматически.",
             parse_mode="HTML")
     else:
         await state.set_state(States.waiting_peer_username)
         await call.message.edit_text(
-            "🤖 <b>Жалоба на бота</b>\n\nОтправьте @юзернейм бота:\n• <code>@somebot</code>",
+            "🤖 <b>Жалоба на бота</b>\n\n"
+            "Отправьте @юзернейм бота:\n• <code>@somebot</code>\n\n"
+            "ℹ️ Тип (канал/группа/бот) будет определён автоматически.",
             parse_mode="HTML")
     await call.answer()
 
@@ -716,35 +738,41 @@ async def got_peer_username(message: Message, state: FSMContext):
             parse_mode="HTML",
             reply_markup=await get_main_keyboard(uid, False)); return
 
-    # Проверка публичности канала/группы
-    if peer_type == "channel" and not is_adm:
-        wait_msg = await message.answer("🔍 Проверяю доступность...")
-        ok, err = await check_peer_accessible(uname)
-        try:
-            await wait_msg.delete()
-        except Exception:
-            pass
-        if not ok:
-            await state.clear()
-            if err == "private":
-                await message.answer(
-                    f"⛔ <b>Обращение отклонено.</b>\n\n"
-                    f"Канал/группа <b>@{uname}</b> является приватным.\n"
-                    f"Репорты принимаются только на публичные каналы.",
-                    parse_mode="HTML",
-                    reply_markup=await get_main_keyboard(uid, False))
-            else:
-                await message.answer(
-                    f"❌ Канал/группа <b>@{uname}</b> не найден(а).",
-                    parse_mode="HTML",
-                    reply_markup=await get_main_keyboard(uid, False))
-            return
+    # Авто-определение типа через Telethon (для всех кроме ботов — всегда проверяем)
+    wait_msg = await message.answer("🔍 Определяю тип и проверяю доступность...")
+    ok, err, detected_type = await check_peer_accessible(uname)
+    try:
+        await wait_msg.delete()
+    except Exception:
+        pass
+
+    if not ok:
+        await state.clear()
+        type_label = {"channel": "Канал", "group": "Группа", "bot": "Бот", "user": "Пользователь"}.get(peer_type, "Объект")
+        if err == "private":
+            await message.answer(
+                f"⛔ <b>Обращение отклонено.</b>\n\n"
+                f"{type_label} <b>@{uname}</b> является приватным.\n"
+                f"Репорты принимаются только на публичные объекты.",
+                parse_mode="HTML",
+                reply_markup=await get_main_keyboard(uid, False))
+        else:
+            await message.answer(
+                f"❌ Объект <b>@{uname}</b> не найден.",
+                parse_mode="HTML",
+                reply_markup=await get_main_keyboard(uid, False))
+        return
+
+    # Если Telethon определил тип — переопределяем
+    if detected_type:
+        peer_type = detected_type
+        await state.update_data(peer_type=peer_type)
 
     # Проверка повторного репорта
     if await db.has_peer_reported_before(uid, uname) and not is_adm:
         await db.revoke_subscription(uid)
         await state.clear()
-        icon = "📢" if peer_type == "channel" else "🤖"
+        icon = TYPE_LABELS.get(peer_type, "📢")
         await message.answer(
             f"❌ <b>Повторное обращение на {icon} @{uname} недопустимо.</b>\n\n"
             f"Ваша подписка аннулирована. Оформите новую подписку для продолжения.",
@@ -753,7 +781,7 @@ async def got_peer_username(message: Message, state: FSMContext):
 
     await state.update_data(peer_username=uname)
     await state.set_state(States.waiting_peer_reason)
-    icon = "📢" if peer_type == "channel" else "🤖"
+    icon = TYPE_LABELS.get(peer_type, "📢")
     await message.answer(
         f"{icon} <code>@{uname}</code>\n\n📋 Выберите причину обращения:",
         parse_mode="HTML",
@@ -808,7 +836,8 @@ async def _send_peer_reports(bot: Bot, user_id: int, peer_username: str, peer_ty
                               reply_target=None, call=None):
     is_adm = await db.is_admin(user_id) or user_id in SUPERADMIN_IDS
     sessions = await db.get_all_sessions()
-    icon = "📢" if peer_type == "channel" else "🤖"
+    icon = TYPE_LABELS.get(peer_type, "📢")
+    type_ru = {"channel": "канал", "group": "группу", "bot": "бота", "user": "пользователя"}.get(peer_type, "объект")
 
     if not sessions:
         txt = "❌ Нет активных сессий. Обратитесь к администратору."
@@ -866,7 +895,7 @@ async def _send_peer_reports(bot: Bot, user_id: int, peer_username: str, peer_ty
     user_obj = await db.get_user(user_id)
     uname_str = f"@{user_obj['username']}" if user_obj and user_obj.get("username") else f"id:{user_id}"
     log_text = (
-        f"{'📢' if peer_type == 'channel' else '🤖'} <b>Жалоба на {'канал/группу' if peer_type == 'channel' else 'бота'}</b>\n\n"
+        f"{icon} <b>Жалоба на {type_ru}</b>\n\n"
         f"👤 От: {uname_str} (<code>{user_id}</code>)\n"
         f"🎯 Цель: <code>@{peer_username}</code>\n"
         f"📌 Причина: {reason_name}{extra}\n"
