@@ -40,8 +40,8 @@ import database as db
 #                        НАСТРОЙКИ
 # ============================================================
 
-BOT_TOKEN         = "8770214132:AAEth6uS5IWQNgEcsAuf9eaKUtA_MqM4RwA"
-CRYPTOBOT_TOKEN   = "596342:AApk7WCgW3Ae8xlUwsGmo4RNFMOFe3lQyFR"
+BOT_TOKEN         = "ТОКЕН_ОСНОВНОГО_БОТА"
+CRYPTOBOT_TOKEN   = "ТОКЕН_CRYPTOBOT"
 SUPERADMIN_IDS    = {853173723, 1090307552}
 
 TELETHON_API_ID   = 35989820
@@ -54,8 +54,8 @@ DB_PATH = "bot_database.db"
 
 # Кулдаун между жалобами — 30 минут
 REPORT_COOLDOWN_SECONDS = 1800
-# Бонус за реферала (дней подписки)
-REFERRAL_BONUS_DAYS = 3
+# Бонус за реферала (дней подписки) — выдаётся только при первой оплате реферала
+REFERRAL_BONUS_DAYS = 1
 
 # ============================================================
 
@@ -362,6 +362,37 @@ async def poll_payments(bot: Bot):
                             await bot.send_message(payment["user_id"], f"✅ Оплата подтверждена! Подписка активирована {label}. 🎉")
                         except Exception:
                             pass
+                        # Реферальный бонус: +1 день обоим при первой оплате >= 1 дня
+                        if payment["duration_days"] >= 1:
+                            referrer_id = await db.get_referrer_for_payment_bonus(payment["user_id"])
+                            if referrer_id:
+                                await db.mark_referral_bonus_given(payment["user_id"])
+                                # +1 день рефералу (тому кто купил)
+                                ref_end = await db.grant_subscription(payment["user_id"], REFERRAL_BONUS_DAYS)
+                                try:
+                                    ref_date = ref_end.strftime("%d.%m.%Y") if ref_end else "навсегда"
+                                    await bot.send_message(
+                                        payment["user_id"],
+                                        f"🎁 <b>+{REFERRAL_BONUS_DAYS} день подписки в подарок!</b>\n\n"
+                                        f"Вы зарегистрировались по реферальной ссылке — при первой покупке вам начислен бонусный день.\n"
+                                        f"📅 Ваша подписка продлена до: <b>{ref_date}</b>",
+                                        parse_mode="HTML"
+                                    )
+                                except Exception:
+                                    pass
+                                # +1 день тому кто пригласил
+                                referrer_end = await db.grant_subscription(referrer_id, REFERRAL_BONUS_DAYS)
+                                try:
+                                    referrer_date = referrer_end.strftime("%d.%m.%Y") if referrer_end else "навсегда"
+                                    await bot.send_message(
+                                        referrer_id,
+                                        f"🎉 <b>+{REFERRAL_BONUS_DAYS} день подписки!</b>\n\n"
+                                        f"Ваш реферал впервые оплатил подписку.\n"
+                                        f"📅 Ваша подписка продлена до: <b>{referrer_date}</b>",
+                                        parse_mode="HTML"
+                                    )
+                                except Exception:
+                                    pass
         except Exception as e:
             logger.error(f"poll_payments: {e}")
 
@@ -488,18 +519,9 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
         ref_code = args[4:]
         referrer = await db.get_user_by_ref_code(ref_code)
         if referrer and referrer["user_id"] != u.id and not await db.has_been_referred(u.id):
+            # Только записываем реферала. Бонус (+1 день) выдаётся обоим
+            # при первой оплате реферала минимум на 1 день (в poll_payments).
             await db.add_referral(referrer["user_id"], u.id, REFERRAL_BONUS_DAYS)
-            new_end = await db.grant_subscription(referrer["user_id"], REFERRAL_BONUS_DAYS)
-            try:
-                date_str = new_end.strftime("%d.%m.%Y") if new_end else "навсегда"
-                await bot.send_message(
-                    referrer["user_id"],
-                    f"🎉 <b>+{REFERRAL_BONUS_DAYS} дней подписки!</b>\n\n"
-                    f"По вашей ссылке зарегистрировался новый пользователь.\n"
-                    f"📅 Ваша подписка продлена до: <b>{date_str}</b>",
-                    parse_mode="HTML")
-            except Exception:
-                pass
 
     is_adm = await db.is_admin(u.id) or u.id in SUPERADMIN_IDS
     has_sub = is_adm or await db.has_active_subscription(u.id)
