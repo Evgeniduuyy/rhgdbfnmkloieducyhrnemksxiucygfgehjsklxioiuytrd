@@ -54,6 +54,8 @@ DB_PATH = "bot_database.db"
 
 # Кулдаун между жалобами — 30 минут
 REPORT_COOLDOWN_SECONDS = 1800
+# Бонус за реферала (дней подписки)
+REFERRAL_BONUS_DAYS = 3
 
 # ============================================================
 
@@ -70,6 +72,7 @@ logger = logging.getLogger("bot")
 router = Router()
 user_last_report: dict[int, datetime] = {}
 _auth_clients: dict[int, TelegramClient] = {}
+_session_status: dict[int, str] = {}  # session_id -> status string
 
 REPORT_REASONS = {
     "spam":     ("🗑 Спам",        InputReportReasonSpam()),
@@ -83,6 +86,12 @@ TYPE_LABELS = {
     "bot":     "🤖 Бот",
     "channel": "📢 Канал",
     "group":   "👥 Группа",
+}
+TYPE_ICONS = {
+    "user":    "👤",
+    "bot":     "🤖",
+    "channel": "📢",
+    "group":   "👥",
 }
 
 
@@ -234,6 +243,7 @@ async def get_main_keyboard(user_id: int, is_adm: bool) -> ReplyKeyboardMarkup:
     buttons = [
         [KeyboardButton(text="📨 Подать обращение"), KeyboardButton(text="💎 Купить подписку")],
         [KeyboardButton(text="📄 Моя подписка"),     KeyboardButton(text="🎟 Промокод")],
+        [KeyboardButton(text="📊 Моя статистика"),   KeyboardButton(text="👥 Пригласить друга")],
     ]
     if rules_url:
         buttons.append([KeyboardButton(text="📜 Правила")])
@@ -258,6 +268,7 @@ def admin_kb(is_superadmin: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🛡 Белый список",          callback_data="admin:whitelist")],
         [InlineKeyboardButton(text="📊 Группа логов",          callback_data="admin:log_group"),
          InlineKeyboardButton(text="❌ Снять подписку",        callback_data="admin:revoke_sub")],
+        [InlineKeyboardButton(text="📈 Статистика бота",       callback_data="admin:stats")],
         [InlineKeyboardButton(text="📤 Выгрузить базу данных", callback_data="admin:export_db")],
     ]
     if is_superadmin:
@@ -355,21 +366,42 @@ async def poll_payments(bot: Bot):
             logger.error(f"poll_payments: {e}")
 
 
+async def _check_sessions_with_timeout() -> tuple[list[int], list[str]]:
+    """Проверяет все сессии с таймаутом. Возвращает (bad_ids, status_strings)."""
+    sessions = await db.get_all_sessions()
+    bad: list[int] = []
+    for s in sessions:
+        client = None
+        try:
+            client = TelegramClient(StringSession(s["session_data"]), TELETHON_API_ID, TELETHON_API_HASH)
+            await asyncio.wait_for(client.connect(), timeout=15.0)
+            ok = await asyncio.wait_for(client.is_user_authorized(), timeout=10.0)
+            if ok:
+                me = await asyncio.wait_for(client.get_me(), timeout=10.0)
+                name = f"@{me.username}" if me.username else str(me.id)
+                _session_status[s["id"]] = f"✅ {name}"
+            else:
+                _session_status[s["id"]] = "❌ не авторизован"
+                bad.append(s["id"])
+        except asyncio.TimeoutError:
+            _session_status[s["id"]] = "⏱ таймаут"
+            bad.append(s["id"])
+        except Exception as e:
+            _session_status[s["id"]] = f"⚠️ {str(e)[:30]}"
+            bad.append(s["id"])
+        finally:
+            if client:
+                try: await client.disconnect()
+                except Exception: pass
+        await asyncio.sleep(0.3)
+    return bad, list(_session_status.values())
+
+
 async def hourly_session_check(bot: Bot):
     while True:
         await asyncio.sleep(3600)
         try:
-            sessions = await db.get_all_sessions()
-            bad = []
-            for s in sessions:
-                try:
-                    client = TelegramClient(StringSession(s["session_data"]), TELETHON_API_ID, TELETHON_API_HASH)
-                    await client.connect()
-                    if not await client.is_user_authorized():
-                        bad.append(s["id"])
-                    await client.disconnect()
-                except Exception:
-                    bad.append(s["id"])
+            bad, _ = await _check_sessions_with_timeout()
             if bad:
                 for adm in await db.get_all_admins():
                     try:
@@ -382,6 +414,35 @@ async def hourly_session_check(bot: Bot):
                         pass
         except Exception as e:
             logger.error(f"hourly_session_check: {e}")
+
+
+async def startup_session_check(bot: Bot):
+    """Однократная проверка всех сессий при старте бота."""
+    await asyncio.sleep(5)
+    try:
+        sessions = await db.get_all_sessions()
+        if not sessions:
+            return
+        logger.info(f"Startup: проверяю {len(sessions)} сессий...")
+        bad, _ = await _check_sessions_with_timeout()
+        good = len(sessions) - len(bad)
+        logger.info(f"Startup: сессий ✅ {good} / ❌ {len(bad)}")
+        if bad:
+            for adm in await db.get_all_admins():
+                try:
+                    await bot.send_message(
+                        adm["user_id"],
+                        f"🚀 <b>Бот запущен.</b>\n\n"
+                        f"📋 Сессий проверено: {len(sessions)}\n"
+                        f"✅ Рабочих: {good} | ❌ Проблемных: {len(bad)}\n\n"
+                        f"Проблемные ID: {', '.join(map(str, bad))}\n"
+                        f"Удалите их: Админ панель → Управление сессиями.",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.error(f"startup_session_check: {e}")
 
 
 async def daily_backup_reminder(bot: Bot):
@@ -416,9 +477,30 @@ async def daily_backup_reminder(bot: Bot):
 async def cmd_start(message: Message, bot: Bot, state: FSMContext):
     await state.clear()
     u = message.from_user
+    is_new_user = await db.get_user(u.id) is None
     await db.upsert_user(u.id, u.username or "", u.first_name or "")
     if u.id in SUPERADMIN_IDS:
         await db.set_admin(u.id, True)
+
+    # Обработка реферального кода из /start ref_XXXXXXX
+    args = message.text.split(maxsplit=1)[1] if message.text and len(message.text.split()) > 1 else ""
+    if args.startswith("ref_") and is_new_user:
+        ref_code = args[4:]
+        referrer = await db.get_user_by_ref_code(ref_code)
+        if referrer and referrer["user_id"] != u.id and not await db.has_been_referred(u.id):
+            await db.add_referral(referrer["user_id"], u.id, REFERRAL_BONUS_DAYS)
+            new_end = await db.grant_subscription(referrer["user_id"], REFERRAL_BONUS_DAYS)
+            try:
+                date_str = new_end.strftime("%d.%m.%Y") if new_end else "навсегда"
+                await bot.send_message(
+                    referrer["user_id"],
+                    f"🎉 <b>+{REFERRAL_BONUS_DAYS} дней подписки!</b>\n\n"
+                    f"По вашей ссылке зарегистрировался новый пользователь.\n"
+                    f"📅 Ваша подписка продлена до: <b>{date_str}</b>",
+                    parse_mode="HTML")
+            except Exception:
+                pass
+
     is_adm = await db.is_admin(u.id) or u.id in SUPERADMIN_IDS
     has_sub = is_adm or await db.has_active_subscription(u.id)
     not_ch = [] if is_adm else await check_channels(bot, u.id)
@@ -441,6 +523,61 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
 async def cmd_support(message: Message):
     links = " | ".join(f'<a href="tg://user?id={sid}">{sid}</a>' for sid in SUPERADMIN_IDS)
     await message.answer(f"📞 Супер-администраторы: {links}", parse_mode="HTML")
+
+
+# ─── Личная статистика ──────────────────────────────────────
+
+@router.message(F.text == "📊 Моя статистика")
+async def btn_my_stats(message: Message):
+    uid = message.from_user.id
+    stats = await db.get_user_stats(uid)
+    ref_count = await db.get_referral_count(uid)
+
+    if stats["total"] == 0:
+        report_block = "📭 Вы ещё не подавали обращений."
+    else:
+        rate = round(stats["total_success"] / (stats["msg_success"] + stats["peer_success"] + 1) * 100) if (stats["msg_success"] + stats["peer_success"]) > 0 else 0
+        total_sessions = stats["msg_count"] * 1 + stats["peer_count"] * 1
+        if total_sessions > 0:
+            rate = round((stats["msg_success"] + stats["peer_success"]) / total_sessions * 100)
+        else:
+            rate = 0
+        report_block = (
+            f"📨 <b>Жалобы на сообщения:</b> {stats['msg_count']} шт. (✅ {stats['msg_success']} успешно)\n"
+            f"📢 <b>Жалобы на каналы/группы:</b> {stats['peer_count']} шт. (✅ {stats['peer_success']} успешно)\n"
+            f"📊 <b>Всего обращений:</b> {stats['total']}\n"
+        )
+
+    await message.answer(
+        f"📊 <b>Ваша статистика</b>\n\n"
+        f"{report_block}\n"
+        f"👥 <b>Приглашено друзей:</b> {ref_count} чел. (+{ref_count * REFERRAL_BONUS_DAYS} дн. к подписке)",
+        parse_mode="HTML"
+    )
+
+
+# ─── Реферальная система ────────────────────────────────────
+
+@router.message(F.text == "👥 Пригласить друга")
+async def btn_referral(message: Message):
+    uid = message.from_user.id
+    code = await db.get_or_create_ref_code(uid)
+    ref_count = await db.get_referral_count(uid)
+    bot_info = await message.bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start=ref_{code}"
+    await message.answer(
+        f"👥 <b>Реферальная программа</b>\n\n"
+        f"Приглашайте друзей — за каждого нового пользователя вы получаете "
+        f"<b>+{REFERRAL_BONUS_DAYS} дней</b> подписки!\n\n"
+        f"🔗 <b>Ваша ссылка:</b>\n<code>{ref_link}</code>\n\n"
+        f"📌 Ссылка работает только для <b>новых</b> пользователей, которые ещё не регистрировались в боте.\n\n"
+        f"👤 <b>Приглашено:</b> {ref_count} чел.\n"
+        f"🎁 <b>Заработано:</b> {ref_count * REFERRAL_BONUS_DAYS} дней подписки",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📤 Поделиться ссылкой",
+                                  url=f"https://t.me/share/url?url={ref_link}&text=Присоединяйся+к+нам!")]])
+    )
 
 
 # ─── Подписка / покупка ─────────────────────────────────────
@@ -738,41 +875,48 @@ async def got_peer_username(message: Message, state: FSMContext):
             parse_mode="HTML",
             reply_markup=await get_main_keyboard(uid, False)); return
 
-    # Авто-определение типа через Telethon (для всех кроме ботов — всегда проверяем)
-    wait_msg = await message.answer("🔍 Определяю тип и проверяю доступность...")
-    ok, err, detected_type = await check_peer_accessible(uname)
-    try:
-        await wait_msg.delete()
-    except Exception:
-        pass
+    # Проверка публичности и авто-определение типа через Telethon
+    # Проверяем только каналы/группы у не-администраторов (как в оригинале),
+    # плюс timeout 10 сек чтобы бот не висел при проблемах с Telethon
+    if peer_type in ("channel", "group") and not is_adm:
+        wait_msg = await message.answer("🔍 Проверяю доступность...")
+        try:
+            ok, err, detected_type = await asyncio.wait_for(
+                check_peer_accessible(uname), timeout=10.0)
+        except (asyncio.TimeoutError, Exception):
+            ok, err, detected_type = True, "", ""
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
 
-    if not ok:
-        await state.clear()
-        type_label = {"channel": "Канал", "group": "Группа", "bot": "Бот", "user": "Пользователь"}.get(peer_type, "Объект")
-        if err == "private":
-            await message.answer(
-                f"⛔ <b>Обращение отклонено.</b>\n\n"
-                f"{type_label} <b>@{uname}</b> является приватным.\n"
-                f"Репорты принимаются только на публичные объекты.",
-                parse_mode="HTML",
-                reply_markup=await get_main_keyboard(uid, False))
-        else:
-            await message.answer(
-                f"❌ Объект <b>@{uname}</b> не найден.",
-                parse_mode="HTML",
-                reply_markup=await get_main_keyboard(uid, False))
-        return
+        if not ok:
+            await state.clear()
+            type_label = {"channel": "Канал", "group": "Группа"}.get(peer_type, "Канал/группа")
+            if err == "private":
+                await message.answer(
+                    f"⛔ <b>Обращение отклонено.</b>\n\n"
+                    f"{type_label} <b>@{uname}</b> является приватным.\n"
+                    f"Репорты принимаются только на публичные объекты.",
+                    parse_mode="HTML",
+                    reply_markup=await get_main_keyboard(uid, False))
+            else:
+                await message.answer(
+                    f"❌ {type_label} <b>@{uname}</b> не найден(а).",
+                    parse_mode="HTML",
+                    reply_markup=await get_main_keyboard(uid, False))
+            return
 
-    # Если Telethon определил тип — переопределяем
-    if detected_type:
-        peer_type = detected_type
-        await state.update_data(peer_type=peer_type)
+        # Если Telethon определил точный тип (канал vs группа) — переопределяем
+        if detected_type in ("channel", "group"):
+            peer_type = detected_type
+            await state.update_data(peer_type=peer_type)
 
     # Проверка повторного репорта
     if await db.has_peer_reported_before(uid, uname) and not is_adm:
         await db.revoke_subscription(uid)
         await state.clear()
-        icon = TYPE_LABELS.get(peer_type, "📢")
+        icon = TYPE_ICONS.get(peer_type, "📢")
         await message.answer(
             f"❌ <b>Повторное обращение на {icon} @{uname} недопустимо.</b>\n\n"
             f"Ваша подписка аннулирована. Оформите новую подписку для продолжения.",
@@ -781,7 +925,7 @@ async def got_peer_username(message: Message, state: FSMContext):
 
     await state.update_data(peer_username=uname)
     await state.set_state(States.waiting_peer_reason)
-    icon = TYPE_LABELS.get(peer_type, "📢")
+    icon = TYPE_ICONS.get(peer_type, "📢")
     await message.answer(
         f"{icon} <code>@{uname}</code>\n\n📋 Выберите причину обращения:",
         parse_mode="HTML",
@@ -836,7 +980,7 @@ async def _send_peer_reports(bot: Bot, user_id: int, peer_username: str, peer_ty
                               reply_target=None, call=None):
     is_adm = await db.is_admin(user_id) or user_id in SUPERADMIN_IDS
     sessions = await db.get_all_sessions()
-    icon = TYPE_LABELS.get(peer_type, "📢")
+    icon = TYPE_ICONS.get(peer_type, "📢")
     type_ru = {"channel": "канал", "group": "группу", "bot": "бота", "user": "пользователя"}.get(peer_type, "объект")
 
     if not sessions:
@@ -855,24 +999,30 @@ async def _send_peer_reports(bot: Bot, user_id: int, peer_username: str, peer_ty
 
     success = errors = 0
     for i, sess in enumerate(sessions, 1):
+        client = None
         try:
             client = TelegramClient(StringSession(sess["session_data"]), TELETHON_API_ID, TELETHON_API_HASH)
-            await client.connect()
-            if await client.is_user_authorized():
+            await asyncio.wait_for(client.connect(), timeout=15.0)
+            if await asyncio.wait_for(client.is_user_authorized(), timeout=10.0):
                 try:
-                    peer = await client.get_input_entity(peer_username)
-                    await client(ReportPeerRequest(peer=peer, reason=reason_obj, message=custom_text))
+                    peer = await asyncio.wait_for(client.get_input_entity(peer_username), timeout=10.0)
+                    await asyncio.wait_for(
+                        client(ReportPeerRequest(peer=peer, reason=reason_obj, message=custom_text)),
+                        timeout=15.0)
                     success += 1
                 except Exception as e:
                     logger.warning(f"Peer-сессия {sess['id']}: {e}")
                     errors += 1
             else:
                 errors += 1
-            await client.disconnect()
-        except Exception as e:
+        except (asyncio.TimeoutError, Exception) as e:
             logger.error(f"Peer-сессия {sess['id']} подключение: {e}")
             errors += 1
-        await asyncio.sleep(random.uniform(0.5, 1.0))
+        finally:
+            if client:
+                try: await client.disconnect()
+                except Exception: pass
+        await asyncio.sleep(random.uniform(0.3, 0.7))
         try: await status_msg.edit_text(f"⏳ Верифицирую... ({i}/{total})")
         except Exception: pass
 
@@ -928,25 +1078,32 @@ async def _send_reports(bot: Bot, user_id: int, chat_id_str: str, msg_id_str: st
 
     success = errors = 0
     for i, sess in enumerate(sessions, 1):
+        client = None
         try:
             client = TelegramClient(StringSession(sess["session_data"]), TELETHON_API_ID, TELETHON_API_HASH)
-            await client.connect()
-            if await client.is_user_authorized():
+            await asyncio.wait_for(client.connect(), timeout=15.0)
+            if await asyncio.wait_for(client.is_user_authorized(), timeout=10.0):
                 try:
-                    peer = await client.get_input_entity(
-                        int(chat_id_str) if chat_id_str.lstrip("-").isdigit() else chat_id_str)
-                    await client(ReportRequest(peer=peer, id=[int(msg_id_str)], reason=reason_obj, message=custom_text))
+                    peer = await asyncio.wait_for(client.get_input_entity(
+                        int(chat_id_str) if chat_id_str.lstrip("-").isdigit() else chat_id_str),
+                        timeout=10.0)
+                    await asyncio.wait_for(
+                        client(ReportRequest(peer=peer, id=[int(msg_id_str)], reason=reason_obj, message=custom_text)),
+                        timeout=15.0)
                     success += 1
                 except Exception as e:
                     logger.warning(f"Сессия {sess['id']}: {e}")
                     errors += 1
             else:
                 errors += 1
-            await client.disconnect()
-        except Exception as e:
+        except (asyncio.TimeoutError, Exception) as e:
             logger.error(f"Сессия {sess['id']} подключение: {e}")
             errors += 1
-        await asyncio.sleep(random.uniform(0.5, 1.0))
+        finally:
+            if client:
+                try: await client.disconnect()
+                except Exception: pass
+        await asyncio.sleep(random.uniform(0.3, 0.7))
         try: await status_msg.edit_text(f"⏳ Верифицирую... ({i}/{total})")
         except Exception: pass
 
@@ -1294,28 +1451,44 @@ async def got_2fa(message: Message, state: FSMContext):
 async def cb_sess_check(call: CallbackQuery):
     if not (await db.is_admin(call.from_user.id) or call.from_user.id in SUPERADMIN_IDS):
         await call.answer("❌ Нет доступа", show_alert=True); return
-    await call.message.edit_text("🔄 Проверяю все сессии...")
     sessions = await db.get_all_sessions()
     if not sessions:
         await call.message.edit_text("📭 Нет сохранённых сессий.", reply_markup=sessions_kb())
         await call.answer(); return
-
+    await call.message.edit_text(f"🔄 Проверяю сессии (0/{len(sessions)})...")
     results = []
-    for sess in sessions:
+    for i, sess in enumerate(sessions, 1):
+        client = None
         try:
             client = TelegramClient(StringSession(sess["session_data"]), TELETHON_API_ID, TELETHON_API_HASH)
-            await client.connect()
-            if await client.is_user_authorized():
-                me = await client.get_me()
-                results.append(f"✅ #{sess['id']} — @{me.username or me.id}")
+            await asyncio.wait_for(client.connect(), timeout=15.0)
+            ok = await asyncio.wait_for(client.is_user_authorized(), timeout=10.0)
+            if ok:
+                me = await asyncio.wait_for(client.get_me(), timeout=10.0)
+                name = f"@{me.username}" if me.username else str(me.id)
+                _session_status[sess["id"]] = f"✅ {name}"
+                results.append(f"✅ #{sess['id']} — {name}")
             else:
+                _session_status[sess["id"]] = "❌ не авторизован"
                 results.append(f"❌ #{sess['id']} — не авторизован")
-            await client.disconnect()
+        except asyncio.TimeoutError:
+            _session_status[sess["id"]] = "⏱ таймаут"
+            results.append(f"⏱ #{sess['id']} — таймаут подключения")
         except Exception as e:
-            results.append(f"⚠️ #{sess['id']} — ошибка: {str(e)[:40]}")
+            _session_status[sess["id"]] = f"⚠️ {str(e)[:30]}"
+            results.append(f"⚠️ #{sess['id']} — {str(e)[:40]}")
+        finally:
+            if client:
+                try: await client.disconnect()
+                except Exception: pass
+        try:
+            await call.message.edit_text(f"🔄 Проверяю сессии ({i}/{len(sessions)})...")
+        except Exception:
+            pass
         await asyncio.sleep(0.3)
 
-    text = "📋 <b>Статус сессий:</b>\n\n" + "\n".join(results)
+    good = sum(1 for r in results if r.startswith("✅"))
+    text = f"📋 <b>Статус сессий ({good}/{len(sessions)} рабочих):</b>\n\n" + "\n".join(results)
     await call.message.edit_text(text[:4000], parse_mode="HTML", reply_markup=sessions_kb())
     await call.answer()
 
@@ -2137,6 +2310,45 @@ async def got_rules_url(message: Message, state: FSMContext):
     await message.answer("✅ URL правил обновлён.")
 
 
+# ─── Статистика бота (админ) ───────────────────────────────
+
+@router.callback_query(F.data == "admin:stats")
+async def cb_admin_stats(call: CallbackQuery):
+    if not (await db.is_admin(call.from_user.id) or call.from_user.id in SUPERADMIN_IDS):
+        await call.answer("❌ Нет доступа", show_alert=True); return
+    await call.answer()
+    s = await db.get_global_stats()
+
+    top_text = ""
+    if s["top_peers"]:
+        top_text = "\n\n🏆 <b>Топ целей жалоб:</b>\n"
+        for i, p in enumerate(s["top_peers"], 1):
+            top_text += f"{i}. @{p['username']} — {p['count']} раз (✅ {p['success']})\n"
+
+    sess_text = ""
+    if _session_status:
+        good_sess = sum(1 for v in _session_status.values() if v.startswith("✅"))
+        sess_text = f"\n📡 Сессий работает: <b>{good_sess}/{len(_session_status)}</b>"
+
+    text = (
+        f"📈 <b>Статистика бота</b>\n\n"
+        f"👤 Пользователей: <b>{s['user_count']}</b>\n"
+        f"💎 Активных подписок: <b>{s['sub_count']}</b>\n"
+        f"📂 Сессий Telethon: <b>{s['sess_count']}</b>"
+        f"{sess_text}\n\n"
+        f"📨 Жалоб на сообщения: <b>{s['msg_count']}</b>\n"
+        f"📢 Жалоб на каналы/группы: <b>{s['peer_count']}</b>\n"
+        f"📊 Всего обращений: <b>{s['total']}</b>\n"
+        f"✅ Успешных: <b>{s['total_success']}</b> ({s['success_rate']}%)\n"
+        f"👥 Рефералов: <b>{s['ref_count']}</b>"
+        f"{top_text}"
+    )
+    await call.message.edit_text(
+        text, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")]]))
+
+
 # ─── Запуск ────────────────────────────────────────────────
 
 async def main():
@@ -2147,6 +2359,7 @@ async def main():
     asyncio.create_task(poll_payments(bot))
     asyncio.create_task(hourly_session_check(bot))
     asyncio.create_task(daily_backup_reminder(bot))
+    asyncio.create_task(startup_session_check(bot))
     logger.info("Бот запущен ✅")
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
