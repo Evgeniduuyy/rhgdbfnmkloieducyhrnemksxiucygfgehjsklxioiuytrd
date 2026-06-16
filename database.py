@@ -556,4 +556,3 @@ async def delete_subscription_plan(plan_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM subscription_plans WHERE id=?", (plan_id,))
         await db.commit()
-
