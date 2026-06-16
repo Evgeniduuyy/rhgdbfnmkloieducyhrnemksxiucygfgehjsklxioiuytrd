@@ -14,7 +14,23 @@ async def init_db():
                 first_name TEXT,
                 is_admin BOOLEAN DEFAULT 0,
                 subscription_end TIMESTAMP NULL,
-                subscription_lifetime BOOLEAN DEFAULT 0
+                subscription_lifetime BOOLEAN DEFAULT 0,
+                ref_code TEXT UNIQUE
+            )
+        """)
+        # Migration: add ref_code to existing databases
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN ref_code TEXT")
+            await db.commit()
+        except Exception:
+            pass
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS referrals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                referrer_id INTEGER NOT NULL,
+                referred_id INTEGER NOT NULL UNIQUE,
+                bonus_days INTEGER DEFAULT 3,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         await db.execute("""
@@ -556,3 +572,120 @@ async def delete_subscription_plan(plan_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM subscription_plans WHERE id=?", (plan_id,))
         await db.commit()
+
+
+# ─── Реферальная система ───────────────────────────────────
+
+async def get_or_create_ref_code(user_id: int) -> str:
+    import string, secrets
+    user = await get_user(user_id)
+    if user and user.get("ref_code"):
+        return user["ref_code"]
+    while True:
+        code = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(7))
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT user_id FROM users WHERE ref_code=?", (code,)) as cur:
+                if not await cur.fetchone():
+                    await db.execute("UPDATE users SET ref_code=? WHERE user_id=?", (code, user_id))
+                    await db.commit()
+                    return code
+
+
+async def get_user_by_ref_code(code: str) -> Optional[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM users WHERE ref_code=?", (code,)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def has_been_referred(user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT id FROM referrals WHERE referred_id=?", (user_id,)) as cur:
+            return await cur.fetchone() is not None
+
+
+async def add_referral(referrer_id: int, referred_id: int, bonus_days: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "INSERT INTO referrals (referrer_id, referred_id, bonus_days) VALUES (?,?,?)",
+                (referrer_id, referred_id, bonus_days)
+            )
+            await db.commit()
+        except aiosqlite.IntegrityError:
+            pass
+
+
+async def get_referral_count(user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=?", (user_id,)) as cur:
+            return (await cur.fetchone())[0]
+
+
+# ─── Статистика ────────────────────────────────────────────
+
+async def get_user_stats(user_id: int) -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(success_count),0), COALESCE(SUM(total_count),0) "
+            "FROM report_logs WHERE user_id=?", (user_id,)
+        ) as cur:
+            msg_count, msg_success, msg_total = await cur.fetchone()
+        async with db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(success_count),0), COALESCE(SUM(total_count),0) "
+            "FROM peer_report_logs WHERE user_id=?", (user_id,)
+        ) as cur:
+            peer_count, peer_success, peer_total = await cur.fetchone()
+    return {
+        "msg_count": int(msg_count),
+        "msg_success": int(msg_success),
+        "peer_count": int(peer_count),
+        "peer_success": int(peer_success),
+        "total": int(msg_count) + int(peer_count),
+        "total_success": int(msg_success) + int(peer_success),
+    }
+
+
+async def get_global_stats() -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(success_count),0) FROM report_logs"
+        ) as cur:
+            msg_count, msg_success = await cur.fetchone()
+        async with db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(success_count),0) FROM peer_report_logs"
+        ) as cur:
+            peer_count, peer_success = await cur.fetchone()
+        async with db.execute("""
+            SELECT peer_username, COUNT(*) as cnt, COALESCE(SUM(success_count),0) as sc
+            FROM peer_report_logs GROUP BY LOWER(peer_username)
+            ORDER BY cnt DESC LIMIT 5
+        """) as cur:
+            top_peers = [{"username": r[0], "count": r[1], "success": r[2]}
+                         for r in await cur.fetchall()]
+        async with db.execute("SELECT COUNT(*) FROM users") as cur:
+            user_count = (await cur.fetchone())[0]
+        async with db.execute("""
+            SELECT COUNT(*) FROM users WHERE subscription_lifetime=1
+            OR (subscription_end IS NOT NULL AND subscription_end > datetime('now'))
+        """) as cur:
+            sub_count = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM sessions WHERE is_active=1") as cur:
+            sess_count = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM referrals") as cur:
+            ref_count = (await cur.fetchone())[0]
+    total = int(msg_count) + int(peer_count)
+    total_success = int(msg_success) + int(peer_success)
+    return {
+        "msg_count": int(msg_count),
+        "peer_count": int(peer_count),
+        "total": total,
+        "total_success": total_success,
+        "success_rate": round(total_success / total * 100, 1) if total > 0 else 0,
+        "top_peers": top_peers,
+        "user_count": int(user_count),
+        "sub_count": int(sub_count),
+        "sess_count": int(sess_count),
+        "ref_count": int(ref_count),
+    }
