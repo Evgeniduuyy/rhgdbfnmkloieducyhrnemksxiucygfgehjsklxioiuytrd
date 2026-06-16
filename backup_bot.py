@@ -227,7 +227,8 @@ async def _buy_keyboard() -> InlineKeyboardMarkup:
         ])
     rows = []
     for p in plans:
-        label = f"{'♾️ Навсегда' if p['days'] == 0 else f'📅 {p[\"days\"]} дней'} — {p['price']:.0f} USD"
+        days_str = '♾️ Навсегда' if p['days'] == 0 else f"📅 {p['days']} дней"
+        label = f"{days_str} — {p['price']:.0f} USD"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"buy:{p['days']}:{p['price']}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
