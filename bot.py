@@ -40,8 +40,8 @@ import database as db
 #                        НАСТРОЙКИ
 # ============================================================
 
-BOT_TOKEN         = "8770214132:AAEth6uS5IWQNgEcsAuf9eaKUtA_MqM4RwA"
-CRYPTOBOT_TOKEN   = "596342:AApk7WCgW3Ae8xlUwsGmo4RNFMOFe3lQyFR"
+BOT_TOKEN         = "ТОКЕН_ОСНОВНОГО_БОТА"
+CRYPTOBOT_TOKEN   = "ТОКЕН_CRYPTOBOT"
 SUPERADMIN_IDS    = {853173723, 1090307552}
 
 TELETHON_API_ID   = 35989820
@@ -1063,6 +1063,200 @@ async def got_session_string(message: Message, state: FSMContext, bot: Bot):
         await status_msg.edit_text(
             f"❌ <b>Ошибка проверки сессии:</b>\n\n<code>{e}</code>\n\n"
             "Убедитесь что строка верная и попробуйте снова.",
+            parse_mode="HTML"
+        )
+
+
+# ─── Авторизация по номеру телефона ─────────────────────────
+
+@router.callback_query(F.data == "sess:phone")
+async def cb_sess_phone(call: CallbackQuery, state: FSMContext):
+    if not (await db.is_admin(call.from_user.id) or call.from_user.id in SUPERADMIN_IDS):
+        await call.answer("❌ Нет доступа", show_alert=True); return
+    await state.set_state(States.waiting_phone)
+    await call.message.edit_text(
+        "📱 <b>Авторизация по номеру телефона</b>\n\n"
+        "Введите номер телефона в международном формате:\n"
+        "• <code>+79001234567</code>\n"
+        "• <code>+380501234567</code>\n\n"
+        "/cancel — отмена",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data="admin:sessions")]
+        ])
+    )
+    await call.answer()
+
+
+@router.message(States.waiting_phone)
+async def got_phone(message: Message, state: FSMContext):
+    if not (await db.is_admin(message.from_user.id) or message.from_user.id in SUPERADMIN_IDS):
+        await state.clear(); return
+    if message.text and message.text.strip() == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено.", reply_markup=sessions_kb()); return
+
+    phone = (message.text or "").strip()
+    if not (phone.startswith("+") and phone[1:].isdigit() and len(phone) >= 8):
+        await message.answer(
+            "❌ Неверный формат номера. Введите в виде <code>+79001234567</code>:",
+            parse_mode="HTML"
+        ); return
+
+    status_msg = await message.answer("🔄 Отправляю код подтверждения...")
+    uid = message.from_user.id
+
+    try:
+        client = TelegramClient(StringSession(), TELETHON_API_ID, TELETHON_API_HASH)
+        await client.connect()
+        result = await client.send_code_request(phone)
+        _auth_clients[uid] = client
+        await state.update_data(phone=phone, phone_code_hash=result.phone_code_hash)
+        await state.set_state(States.waiting_code)
+        await status_msg.edit_text(
+            f"📲 <b>Код отправлен!</b>\n\n"
+            f"На номер <code>{phone}</code> отправлен SMS-код.\n\n"
+            f"Введите полученный код (только цифры, например <code>12345</code>):\n\n"
+            f"/cancel — отмена",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Отмена", callback_data="admin:sessions")]
+            ])
+        )
+    except FloodWaitError as e:
+        await status_msg.edit_text(
+            f"⏳ Слишком много попыток. Подождите <b>{e.seconds} сек.</b> и попробуйте снова.",
+            parse_mode="HTML"
+        )
+        await state.clear()
+    except Exception as e:
+        await status_msg.edit_text(
+            f"❌ Ошибка при отправке кода:\n<code>{e}</code>",
+            parse_mode="HTML"
+        )
+        await state.clear()
+
+
+@router.message(States.waiting_code)
+async def got_code(message: Message, state: FSMContext):
+    if not (await db.is_admin(message.from_user.id) or message.from_user.id in SUPERADMIN_IDS):
+        await state.clear(); return
+
+    uid = message.from_user.id
+    if message.text and message.text.strip() == "/cancel":
+        client = _auth_clients.pop(uid, None)
+        if client:
+            try: await client.disconnect()
+            except Exception: pass
+        await state.clear()
+        await message.answer("❌ Отменено.", reply_markup=sessions_kb()); return
+
+    code = (message.text or "").strip().replace(" ", "")
+    if not code.isdigit():
+        await message.answer("❌ Код должен состоять только из цифр. Попробуйте снова:"); return
+
+    client = _auth_clients.get(uid)
+    if not client:
+        await state.clear()
+        await message.answer(
+            "❌ Сессия авторизации истекла. Начните процесс заново через кнопку «Авторизоваться по номеру»."
+        ); return
+
+    data = await state.get_data()
+    phone = data.get("phone")
+    phone_code_hash = data.get("phone_code_hash")
+    status_msg = await message.answer("🔄 Проверяю код...")
+
+    try:
+        await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+        me = await client.get_me()
+        session_str = client.session.save()
+        await client.disconnect()
+        _auth_clients.pop(uid, None)
+        await state.clear()
+        sess_id = await db.add_session(session_str)
+        await db.log_admin_action(uid, "add_session_phone", f"id={sess_id} user={me.username or me.id}")
+        await status_msg.edit_text(
+            f"✅ <b>Авторизация успешна!</b>\n\n"
+            f"👤 Аккаунт: <code>{(me.first_name or '')} {(me.last_name or '')}</code>\n"
+            f"📱 Username: @{me.username or '—'}\n"
+            f"🆔 ID сессии: <code>{sess_id}</code>",
+            parse_mode="HTML"
+        )
+    except SessionPasswordNeededError:
+        await state.set_state(States.waiting_2fa)
+        await status_msg.edit_text(
+            "🔐 <b>Требуется пароль двухфакторной аутентификации (2FA)</b>\n\n"
+            "Введите ваш пароль облачного шифрования Telegram:\n\n"
+            "/cancel — отмена",
+            parse_mode="HTML"
+        )
+    except PhoneCodeInvalidError:
+        await status_msg.edit_text(
+            "❌ Неверный код. Проверьте и введите снова:"
+        )
+    except PhoneCodeExpiredError:
+        _auth_clients.pop(uid, None)
+        await state.clear()
+        await status_msg.edit_text(
+            "❌ Срок действия кода истёк. Запросите новый через кнопку «Авторизоваться по номеру»."
+        )
+    except Exception as e:
+        await status_msg.edit_text(
+            f"❌ Ошибка при входе:\n<code>{e}</code>",
+            parse_mode="HTML"
+        )
+
+
+@router.message(States.waiting_2fa)
+async def got_2fa(message: Message, state: FSMContext):
+    if not (await db.is_admin(message.from_user.id) or message.from_user.id in SUPERADMIN_IDS):
+        await state.clear(); return
+
+    uid = message.from_user.id
+    if message.text and message.text.strip() == "/cancel":
+        client = _auth_clients.pop(uid, None)
+        if client:
+            try: await client.disconnect()
+            except Exception: pass
+        await state.clear()
+        await message.answer("❌ Отменено.", reply_markup=sessions_kb()); return
+
+    password = (message.text or "").strip()
+    if not password:
+        await message.answer("❌ Пароль не может быть пустым. Введите ваш пароль 2FA:"); return
+
+    client = _auth_clients.get(uid)
+    if not client:
+        await state.clear()
+        await message.answer(
+            "❌ Сессия авторизации истекла. Начните процесс заново через кнопку «Авторизоваться по номеру»."
+        ); return
+
+    status_msg = await message.answer("🔄 Проверяю пароль...")
+    try:
+        await client.sign_in(password=password)
+        me = await client.get_me()
+        session_str = client.session.save()
+        await client.disconnect()
+        _auth_clients.pop(uid, None)
+        await state.clear()
+        sess_id = await db.add_session(session_str)
+        await db.log_admin_action(uid, "add_session_phone_2fa", f"id={sess_id} user={me.username or me.id}")
+        await status_msg.edit_text(
+            f"✅ <b>Авторизация успешна!</b>\n\n"
+            f"👤 Аккаунт: <code>{(me.first_name or '')} {(me.last_name or '')}</code>\n"
+            f"📱 Username: @{me.username or '—'}\n"
+            f"🆔 ID сессии: <code>{sess_id}</code>",
+            parse_mode="HTML"
+        )
+    except PasswordHashInvalidError:
+        await status_msg.edit_text(
+            "❌ Неверный пароль 2FA. Попробуйте снова:"
+        )
+    except Exception as e:
+        await status_msg.edit_text(
+            f"❌ Ошибка при проверке пароля:\n<code>{e}</code>",
             parse_mode="HTML"
         )
 
