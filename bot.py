@@ -40,8 +40,8 @@ import database as db
 #                        НАСТРОЙКИ
 # ============================================================
 
-BOT_TOKEN         = "ТОКЕН_ОСНОВНОГО_БОТА"
-CRYPTOBOT_TOKEN   = "ТОКЕН_CRYPTOBOT"
+BOT_TOKEN         = "8770214132:AAEth6uS5IWQNgEcsAuf9eaKUtA_MqM4RwA"
+CRYPTOBOT_TOKEN   = "596342:AApk7WCgW3Ae8xlUwsGmo4RNFMOFe3lQyFR"
 SUPERADMIN_IDS    = {853173723, 1090307552}
 
 TELETHON_API_ID   = 35989820
