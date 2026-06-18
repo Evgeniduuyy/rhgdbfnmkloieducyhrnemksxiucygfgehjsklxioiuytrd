@@ -29,10 +29,17 @@ async def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 referrer_id INTEGER NOT NULL,
                 referred_id INTEGER NOT NULL UNIQUE,
-                bonus_days INTEGER DEFAULT 3,
+                bonus_days INTEGER DEFAULT 1,
+                bonus_given INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Migration: add bonus_given to existing databases
+        try:
+            await db.execute("ALTER TABLE referrals ADD COLUMN bonus_given INTEGER DEFAULT 0")
+            await db.commit()
+        except Exception:
+            pass
         await db.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,7 +56,21 @@ async def init_db():
                 duration_days INTEGER,
                 status TEXT DEFAULT 'pending',
                 crypto_invoice_id TEXT,
+                payment_type TEXT DEFAULT 'regular',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Migration: add payment_type to existing databases
+        try:
+            await db.execute("ALTER TABLE payments ADD COLUMN payment_type TEXT DEFAULT 'regular'")
+            await db.commit()
+        except Exception:
+            pass
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS premium_subscriptions (
+                user_id INTEGER PRIMARY KEY,
+                purchased_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_active INTEGER DEFAULT 1
             )
         """)
         await db.execute("""
@@ -58,22 +79,38 @@ async def init_db():
                 user_id INTEGER,
                 chat_id TEXT,
                 message_id TEXT,
+                report_id TEXT DEFAULT '',
+                reason_name TEXT DEFAULT '',
                 report_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 success_count INTEGER DEFAULT 0,
                 total_count INTEGER DEFAULT 0
             )
         """)
+        for col in [("report_id", "TEXT DEFAULT ''"), ("reason_name", "TEXT DEFAULT ''")]:
+            try:
+                await db.execute(f"ALTER TABLE report_logs ADD COLUMN {col[0]} {col[1]}")
+                await db.commit()
+            except Exception:
+                pass
         await db.execute("""
             CREATE TABLE IF NOT EXISTS peer_report_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
                 peer_username TEXT,
                 peer_type TEXT,
+                report_id TEXT DEFAULT '',
+                reason_name TEXT DEFAULT '',
                 report_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 success_count INTEGER DEFAULT 0,
                 total_count INTEGER DEFAULT 0
             )
         """)
+        for col in [("report_id", "TEXT DEFAULT ''"), ("reason_name", "TEXT DEFAULT ''")]:
+            try:
+                await db.execute(f"ALTER TABLE peer_report_logs ADD COLUMN {col[0]} {col[1]}")
+                await db.commit()
+            except Exception:
+                pass
         await db.execute("""
             CREATE TABLE IF NOT EXISTS backup_bot (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -330,23 +367,57 @@ async def has_peer_reported_before(user_id: int, peer_username: str) -> bool:
             return await cursor.fetchone() is not None
 
 
-async def add_report_log(user_id: int, chat_id: str, message_id: str, success: int, total: int):
+async def add_report_log(user_id: int, chat_id: str, message_id: str, success: int, total: int,
+                         report_id: str = "", reason_name: str = ""):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO report_logs (user_id,chat_id,message_id,success_count,total_count) VALUES (?,?,?,?,?)",
-            (user_id, chat_id, message_id, success, total)
+            "INSERT INTO report_logs (user_id,chat_id,message_id,success_count,total_count,report_id,reason_name) VALUES (?,?,?,?,?,?,?)",
+            (user_id, chat_id, message_id, success, total, report_id, reason_name)
         )
         await db.commit()
 
 
-async def add_peer_report_log(user_id: int, peer_username: str, peer_type: str, success: int, total: int):
+async def add_peer_report_log(user_id: int, peer_username: str, peer_type: str, success: int, total: int,
+                               report_id: str = "", reason_name: str = ""):
     normalized = peer_username.lower().lstrip("@")
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO peer_report_logs (user_id,peer_username,peer_type,success_count,total_count) VALUES (?,?,?,?,?)",
-            (user_id, normalized, peer_type, success, total)
+            "INSERT INTO peer_report_logs (user_id,peer_username,peer_type,success_count,total_count,report_id,reason_name) VALUES (?,?,?,?,?,?,?)",
+            (user_id, normalized, peer_type, success, total, report_id, reason_name)
         )
         await db.commit()
+
+
+async def get_user_report_history(user_id: int, limit: int = 7) -> list:
+    """Последние N обращений пользователя (оба типа), отсортированные по времени."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT 'message' AS rtype, report_id, reason_name, chat_id AS target,
+                   success_count, total_count, report_time
+            FROM report_logs WHERE user_id=?
+            UNION ALL
+            SELECT peer_type AS rtype, report_id, reason_name, peer_username AS target,
+                   success_count, total_count, report_time
+            FROM peer_report_logs WHERE user_id=?
+            ORDER BY report_time DESC LIMIT ?
+        """, (user_id, user_id, limit)) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def get_top_reported_targets(limit: int = 10) -> list:
+    """Топ объектов по количеству полученных жалоб."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT peer_username AS target, peer_type AS rtype,
+                   COUNT(*) as report_count,
+                   COALESCE(SUM(success_count),0) as total_success
+            FROM peer_report_logs
+            GROUP BY LOWER(peer_username)
+            ORDER BY report_count DESC LIMIT ?
+        """, (limit,)) as cur:
+            return [dict(r) for r in await cur.fetchall()]
 
 
 # ─── Платежи ───────────────────────────────────────────────
@@ -354,8 +425,18 @@ async def add_peer_report_log(user_id: int, peer_username: str, peer_type: str, 
 async def add_payment(user_id: int, amount: float, days: int, invoice_id: str) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "INSERT INTO payments (user_id,amount,duration_days,status,crypto_invoice_id) VALUES (?,?,?,'pending',?)",
+            "INSERT INTO payments (user_id,amount,duration_days,status,crypto_invoice_id,payment_type) VALUES (?,?,?,'pending',?,'regular')",
             (user_id, amount, days, invoice_id)
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def add_premium_payment(user_id: int, amount: float, invoice_id: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "INSERT INTO payments (user_id,amount,duration_days,status,crypto_invoice_id,payment_type) VALUES (?,?,0,'pending',?,'premium')",
+            (user_id, amount, invoice_id)
         )
         await db.commit()
         return cursor.lastrowid
@@ -621,6 +702,62 @@ async def get_referral_count(user_id: int) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=?", (user_id,)) as cur:
             return (await cur.fetchone())[0]
+
+
+async def get_referrer_for_payment_bonus(referred_id: int) -> Optional[int]:
+    """Возвращает referrer_id если бонус ещё не был выдан, иначе None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT referrer_id FROM referrals WHERE referred_id=? AND bonus_given=0",
+            (referred_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else None
+
+
+async def mark_referral_bonus_given(referred_id: int):
+    """Помечает реферальный бонус как выданный."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE referrals SET bonus_given=1 WHERE referred_id=?",
+            (referred_id,)
+        )
+        await db.commit()
+
+
+# ─── Premium подписка ───────────────────────────────────────
+
+async def has_active_premium(user_id: int) -> bool:
+    """True только если у пользователя есть premium И активна обычная подписка."""
+    if not await has_active_subscription(user_id):
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT is_active FROM premium_subscriptions WHERE user_id=? AND is_active=1",
+            (user_id,)
+        ) as cur:
+            return await cur.fetchone() is not None
+
+
+async def activate_premium(user_id: int):
+    """Активирует premium подписку пользователю."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO premium_subscriptions (user_id, is_active, purchased_at)
+            VALUES (?, 1, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET is_active=1, purchased_at=CURRENT_TIMESTAMP
+        """, (user_id,))
+        await db.commit()
+
+
+async def has_premium_record(user_id: int) -> bool:
+    """True если у пользователя когда-либо была premium (даже если сейчас на паузе)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id FROM premium_subscriptions WHERE user_id=?",
+            (user_id,)
+        ) as cur:
+            return await cur.fetchone() is not None
 
 
 # ─── Статистика ────────────────────────────────────────────
