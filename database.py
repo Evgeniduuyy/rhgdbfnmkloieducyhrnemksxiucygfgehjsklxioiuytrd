@@ -182,6 +182,31 @@ async def init_db():
                     (0,  100.0, "♾️ Навсегда"),
                 ]
             )
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS banned_users (
+                user_id INTEGER PRIMARY KEY,
+                reason TEXT DEFAULT '',
+                banned_by INTEGER,
+                banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN captcha_confirmed INTEGER DEFAULT 0")
+            await db.execute("UPDATE users SET captcha_confirmed=1")
+            await db.commit()
+        except Exception:
+            pass
+        for col in [("total_reports", "INTEGER DEFAULT 0"), ("success_reports", "INTEGER DEFAULT 0")]:
+            try:
+                await db.execute(f"ALTER TABLE sessions ADD COLUMN {col[0]} {col[1]}")
+                await db.commit()
+            except Exception:
+                pass
+        try:
+            await db.execute("ALTER TABLE subscription_plans ADD COLUMN stars_price INTEGER DEFAULT 0")
+            await db.commit()
+        except Exception:
+            pass
         await db.commit()
 
 
@@ -782,6 +807,108 @@ async def get_user_stats(user_id: int) -> dict:
         "total": int(msg_count) + int(peer_count),
         "total_success": int(msg_success) + int(peer_success),
     }
+
+
+# ─── Бан пользователей ─────────────────────────────────────
+
+async def ban_user(user_id: int, reason: str, banned_by: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO banned_users (user_id, reason, banned_by) VALUES (?,?,?)"
+            " ON CONFLICT(user_id) DO UPDATE SET reason=excluded.reason,"
+            " banned_by=excluded.banned_by, banned_at=CURRENT_TIMESTAMP",
+            (user_id, reason, banned_by)
+        )
+        await db.commit()
+
+
+async def unban_user(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM banned_users WHERE user_id=?", (user_id,))
+        await db.commit()
+
+
+async def get_banned_user(user_id: int) -> Optional[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM banned_users WHERE user_id=?", (user_id,)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def get_all_banned() -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM banned_users ORDER BY banned_at DESC") as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+# ─── Капча ──────────────────────────────────────────────────
+
+async def set_captcha_confirmed(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET captcha_confirmed=1 WHERE user_id=?", (user_id,))
+        await db.commit()
+
+
+async def has_captcha_confirmed(user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT captcha_confirmed FROM users WHERE user_id=?", (user_id,)) as cur:
+            row = await cur.fetchone()
+            return bool(row[0]) if row else False
+
+
+# ─── Статистика сессий ───────────────────────────────────────
+
+async def increment_session_stats(session_id: int, success: int, total: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE sessions SET total_reports=total_reports+?, success_reports=success_reports+? WHERE id=?",
+            (total, success, session_id)
+        )
+        await db.commit()
+
+
+# ─── Рефереры (лидерборд) ────────────────────────────────────
+
+async def get_referral_leaderboard(limit: int = 10) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT r.referrer_id, u.username, u.first_name, COUNT(*) as ref_count
+            FROM referrals r
+            LEFT JOIN users u ON u.user_id = r.referrer_id
+            GROUP BY r.referrer_id
+            ORDER BY ref_count DESC LIMIT ?
+        """, (limit,)) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+# ─── Stars тарифы ────────────────────────────────────────────
+
+async def update_plan_stars_price(plan_id: int, stars_price: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE subscription_plans SET stars_price=? WHERE id=?", (stars_price, plan_id)
+        )
+        await db.commit()
+
+
+# ─── Истекающие подписки ─────────────────────────────────────
+
+async def get_expiring_subscriptions(days_ahead: int) -> list:
+    """Пользователи, чья подписка истекает в течение следующих days_ahead дней (но не раньше days_ahead-1)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT user_id, username, first_name, subscription_end
+            FROM users
+            WHERE subscription_lifetime = 0
+              AND subscription_end IS NOT NULL
+              AND subscription_end > datetime('now', ?)
+              AND subscription_end <= datetime('now', ?)
+        """, (f"+{days_ahead - 1} days", f"+{days_ahead} days")) as cur:
+            return [dict(r) for r in await cur.fetchall()]
 
 
 async def get_global_stats() -> dict:
