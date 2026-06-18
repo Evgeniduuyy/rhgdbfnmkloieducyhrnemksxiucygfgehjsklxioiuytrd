@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import random
+import string
 import io
 from datetime import datetime, timezone, timedelta
 from logging.handlers import RotatingFileHandler
@@ -30,6 +31,7 @@ from telethon.tl.functions.account import ReportPeerRequest
 from telethon.tl.types import (
     InputReportReasonSpam, InputReportReasonViolence,
     InputReportReasonPornography, InputReportReasonOther,
+    InputReportReasonCopyright, InputReportReasonFake,
     Channel, Chat, User
 )
 from telethon.sessions import StringSession
@@ -40,8 +42,8 @@ import database as db
 #                        НАСТРОЙКИ
 # ============================================================
 
-BOT_TOKEN         = "8770214132:AAEth6uS5IWQNgEcsAuf9eaKUtA_MqM4RwA"
-CRYPTOBOT_TOKEN   = "596342:AApk7WCgW3Ae8xlUwsGmo4RNFMOFe3lQyFR"
+BOT_TOKEN         = "ТОКЕН_ОСНОВНОГО_БОТА"
+CRYPTOBOT_TOKEN   = "ТОКЕН_CRYPTOBOT"
 SUPERADMIN_IDS    = {853173723, 1090307552}
 
 TELETHON_API_ID   = 35989820
@@ -75,10 +77,12 @@ _auth_clients: dict[int, TelegramClient] = {}
 _session_status: dict[int, str] = {}  # session_id -> status string
 
 REPORT_REASONS = {
-    "spam":     ("🗑 Спам",        InputReportReasonSpam()),
-    "violence": ("🔪 Насилие",     InputReportReasonViolence()),
-    "porn":     ("🔞 Порнография", InputReportReasonPornography()),
-    "other":    ("❓ Другое",      InputReportReasonOther()),
+    "spam":       ("🗑 Спам",               InputReportReasonSpam()),
+    "violence":   ("🔪 Насилие",            InputReportReasonViolence()),
+    "porn":       ("🔞 Порнография",         InputReportReasonPornography()),
+    "copyright":  ("©️ Авторские права",    InputReportReasonCopyright()),
+    "fake":       ("🎭 Фейк / самозванство", InputReportReasonFake()),
+    "other":      ("❓ Другое",             InputReportReasonOther()),
 }
 
 TYPE_LABELS = {
@@ -95,15 +99,23 @@ TYPE_ICONS = {
 }
 
 
+def _generate_report_id() -> str:
+    """Генерирует уникальный 8-символьный идентификатор жалобы."""
+    chars = string.ascii_uppercase + string.digits
+    return "RPT-" + "".join(random.choices(chars, k=6))
+
+
 class States(StatesGroup):
     # Обращения
     waiting_report_type    = State()
     waiting_report_link    = State()
     waiting_report_reason  = State()
     waiting_custom_text    = State()
+    waiting_confirm        = State()
     waiting_peer_username  = State()
     waiting_peer_reason    = State()
     waiting_peer_custom    = State()
+    waiting_peer_confirm   = State()
     # Сессии
     waiting_session_string = State()
     waiting_phone          = State()
@@ -136,6 +148,8 @@ class States(StatesGroup):
     # Снятие подписки
     waiting_revoke_uid     = State()
     waiting_revoke_reason  = State()
+    # Premium цена (для админа)
+    waiting_premium_price  = State()
 
 
 # ─── Утилиты ───────────────────────────────────────────────
@@ -239,14 +253,11 @@ def _wl_type_label(wtype: str) -> str:
 # ─── Клавиатуры ────────────────────────────────────────────
 
 async def get_main_keyboard(user_id: int, is_adm: bool) -> ReplyKeyboardMarkup:
-    rules_url = await db.get_setting("rules_url")
     buttons = [
         [KeyboardButton(text="📨 Подать обращение"), KeyboardButton(text="💎 Купить подписку")],
         [KeyboardButton(text="📄 Моя подписка"),     KeyboardButton(text="🎟 Промокод")],
         [KeyboardButton(text="📊 Моя статистика"),   KeyboardButton(text="👥 Пригласить друга")],
     ]
-    if rules_url:
-        buttons.append([KeyboardButton(text="📜 Правила")])
     if is_adm:
         buttons.append([KeyboardButton(text="🔧 Админ панель")])
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
@@ -260,7 +271,8 @@ def admin_kb(is_superadmin: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="👥 Подписчики",           callback_data="admin:subscribers"),
          InlineKeyboardButton(text="📋 Логи",                 callback_data="admin:logs")],
         [InlineKeyboardButton(text="📢 Обязательные каналы",  callback_data="admin:channels")],
-        [InlineKeyboardButton(text="⚙️ Настроить правила",    callback_data="admin:rules")],
+        [InlineKeyboardButton(text="⚙️ Правила",              callback_data="admin:rules"),
+         InlineKeyboardButton(text="💎 Цена Premium",         callback_data="admin:premium_price")],
         [InlineKeyboardButton(text="📣 Рассылка",              callback_data="admin:broadcast")],
         [InlineKeyboardButton(text="🎁 Выдать подписку",       callback_data="admin:grant_sub"),
          InlineKeyboardButton(text="🎟 Промокоды",             callback_data="admin:promos")],
@@ -295,6 +307,7 @@ def whitelist_main_kb() -> InlineKeyboardMarkup:
 
 
 def whitelist_type_kb() -> InlineKeyboardMarkup:
+    # Deprecated: используйте inline-кнопки с wlsave: вместо этой клавиатуры
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👤 Пользователь", callback_data="wltype:user")],
         [InlineKeyboardButton(text="🤖 Бот",          callback_data="wltype:bot")],
@@ -356,10 +369,32 @@ async def poll_payments(bot: Bot):
                     payment = await db.get_payment_by_invoice(inv_id)
                     if payment and payment["status"] == "pending":
                         await db.update_payment_status(inv_id, "paid")
+
+                        # Premium оплата
+                        if payment.get("payment_type") == "premium":
+                            await db.activate_premium(payment["user_id"])
+                            try:
+                                await bot.send_message(
+                                    payment["user_id"],
+                                    "💎 <b>Premium активирован!</b>\n\n"
+                                    "✅ Теперь вам доступны жалобы на каналы, группы и ботов.\n"
+                                    "⚠️ Premium активен пока действует ваша обычная подписка.",
+                                    parse_mode="HTML"
+                                )
+                            except Exception:
+                                pass
+                            continue
+
+                        # Обычная оплата
                         await db.activate_subscription(payment["user_id"], payment["duration_days"])
                         label = "навсегда" if payment["duration_days"] == 0 else f"на {payment['duration_days']} дней"
                         try:
-                            await bot.send_message(payment["user_id"], f"✅ Оплата подтверждена! Подписка активирована {label}. 🎉")
+                            await bot.send_message(
+                                payment["user_id"],
+                                f"✅ <b>Оплата подтверждена!</b>\n\n"
+                                f"🎉 Подписка активирована {label}.",
+                                parse_mode="HTML"
+                            )
                         except Exception:
                             pass
                         # Реферальный бонус: +1 день обоим при первой оплате >= 1 дня
@@ -525,19 +560,141 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
 
     is_adm = await db.is_admin(u.id) or u.id in SUPERADMIN_IDS
     has_sub = is_adm or await db.has_active_subscription(u.id)
+    has_prem = is_adm or await db.has_active_premium(u.id)
     not_ch = [] if is_adm else await check_channels(bot, u.id)
-    status = "✅ Подписка активна." if has_sub else "⚠️ Нет подписки — нажмите <b>💎 Купить подписку</b>."
-    ch_text = ("\n\n📢 Подпишитесь: " + ", ".join(f"@{c['channel_username']}" for c in not_ch)) if not_ch else ""
+
+    if is_adm:
+        status_line = "👑 <b>Администратор</b> — доступ неограничен"
+    elif has_sub and has_prem:
+        status_line = "✅ <b>Подписка активна</b>  •  💎 <b>Premium</b>"
+    elif has_sub:
+        status_line = "✅ <b>Подписка активна</b>"
+    else:
+        status_line = "⚠️ <b>Нет подписки</b> — нажмите 💎 Купить подписку"
+
+    ch_text = ("\n\n📢 <b>Подпишитесь на каналы:</b>\n" + "\n".join(f"• @{c['channel_username']}" for c in not_ch)) if not_ch else ""
+
+    rules_url = await db.get_setting("rules_url")
+    rules_kb = None
+    if rules_url:
+        rules_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📜 Правила использования", url=rules_url)]
+        ])
+
     await message.answer(
         f"👋 Привет, <b>{u.first_name}</b>!\n\n"
-        f"🛡 <b>Сервис верификации и модерации контента.</b>\n\n"
-        f"📌 <b>Возможности:</b>\n"
-        f"• 📨 Многоуровневая верификация обращений\n"
-        f"• 💎 Подписка 30 дней / навсегда\n"
-        f"• 📄 Просмотр статуса доступа\n\n"
-        f"{status}{ch_text}",
+        f"🛡 <b>Сервис верификации и модерации контента</b>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📨  Жалобы на сообщения\n"
+        f"📢  Жалобы на каналы и группы  <i>[Premium]</i>\n"
+        f"🤖  Жалобы на ботов  <i>[Premium]</i>\n"
+        f"👥  Реферальная программа\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{status_line}{ch_text}",
         parse_mode="HTML",
         reply_markup=await get_main_keyboard(u.id, is_adm)
+    )
+    if rules_kb:
+        await message.answer("📜 Ознакомьтесь с правилами перед использованием:", reply_markup=rules_kb)
+
+
+@router.callback_query(F.data == "my:history")
+async def cb_my_history(call: CallbackQuery):
+    uid = call.from_user.id
+    history = await db.get_user_report_history(uid, limit=7)
+    if not history:
+        await call.answer("📭 История обращений пуста", show_alert=True); return
+    icons = {"message": "💬", "channel": "📢", "group": "👥", "bot": "🤖", "user": "👤"}
+    lines = []
+    for r in history:
+        icon = icons.get(r["rtype"], "📨")
+        target = r["target"] or "—"
+        rid = r.get("report_id") or "—"
+        reason = r.get("reason_name") or "—"
+        ok = r["success_count"]
+        tot = r["total_count"]
+        dt = r["report_time"][:10] if r.get("report_time") else ""
+        lines.append(
+            f"{icon} <code>{target}</code>  {dt}\n"
+            f"   📌 {reason}  •  ✅{ok}/{tot}  •  <code>{rid}</code>"
+        )
+    await call.message.edit_text(
+        f"📋 <b>История обращений</b>\n\n" + "\n\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="my:stats_back")]
+        ])
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "my:trending")
+async def cb_my_trending(call: CallbackQuery):
+    rows = await db.get_top_reported_targets(10)
+    if not rows:
+        await call.answer("🔥 Пока нет данных о жалобах", show_alert=True); return
+    lines = []
+    medals = ["🥇", "🥈", "🥉"] + ["▪️"] * 10
+    for i, r in enumerate(rows):
+        target = r.get("target") or "—"
+        cnt = r.get("report_count", 0)
+        lines.append(f"{medals[i]} <code>{target}</code>  — <b>{cnt}</b> жалоб")
+    await call.message.edit_text(
+        "🔥 <b>Горячие цели</b>\n<i>Чаще всего жалуются на:</i>\n\n" + "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="my:stats_back")]
+        ])
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "my:stats_back")
+async def cb_my_stats_back(call: CallbackQuery):
+    await call.message.delete()
+    await call.answer()
+
+
+@router.message(Command("trending"))
+async def cmd_trending(message: Message):
+    rows = await db.get_top_reported_targets(10)
+    if not rows:
+        await message.answer("🔥 Пока нет данных о жалобах."); return
+    lines = []
+    medals = ["🥇", "🥈", "🥉"] + ["▪️"] * 10
+    for i, r in enumerate(rows):
+        target = r.get("target") or "—"
+        cnt = r.get("report_count", 0)
+        lines.append(f"{medals[i]} <code>{target}</code>  — <b>{cnt}</b> жалоб")
+    await message.answer(
+        "🔥 <b>Горячие цели</b>\n<i>Топ объектов по количеству жалоб:</i>\n\n" + "\n".join(lines),
+        parse_mode="HTML"
+    )
+
+
+@router.message(Command("myreports"))
+async def cmd_myreports(message: Message):
+    uid = message.from_user.id
+    history = await db.get_user_report_history(uid, limit=7)
+    if not history:
+        await message.answer("📭 Вы ещё не подавали ни одного обращения."); return
+    icons = {"message": "💬", "channel": "📢", "group": "👥", "bot": "🤖", "user": "👤"}
+    lines = []
+    for r in history:
+        icon = icons.get(r["rtype"], "📨")
+        target = r["target"] or "—"
+        rid = r.get("report_id") or "—"
+        reason = r.get("reason_name") or "—"
+        ok = r["success_count"]
+        tot = r["total_count"]
+        dt = r["report_time"][:10] if r.get("report_time") else ""
+        lines.append(
+            f"{icon} <code>{target}</code>  {dt}\n"
+            f"   📌 {reason}  •  ✅{ok}/{tot}  •  <code>{rid}</code>"
+        )
+    await message.answer(
+        f"📋 <b>Мои обращения (последние {len(history)})</b>\n\n" + "\n\n".join(lines),
+        parse_mode="HTML"
     )
 
 
@@ -554,27 +711,70 @@ async def btn_my_stats(message: Message):
     uid = message.from_user.id
     stats = await db.get_user_stats(uid)
     ref_count = await db.get_referral_count(uid)
+    history = await db.get_user_report_history(uid, limit=30)
+    total = stats["total"]
 
-    if stats["total"] == 0:
-        report_block = "📭 Вы ещё не подавали обращений."
+    has_prem = await db.has_active_premium(uid)
+    is_adm = await db.is_admin(uid) or uid in SUPERADMIN_IDS
+
+    # Считаем реальный процент успеха
+    total_ok = stats["msg_success"] + stats["peer_success"]
+    total_sent_sessions = sum(r["total_count"] for r in history) if history else 0
+    pct = round(total_ok / total_sent_sessions * 100) if total_sent_sessions > 0 else 0
+
+    # Серия (streak) — сколько дней подряд были репорты
+    if history:
+        dates = sorted({r["report_time"][:10] for r in history if r.get("report_time")}, reverse=True)
+        streak = 1
+        from datetime import date
+        for i in range(1, len(dates)):
+            d1 = date.fromisoformat(dates[i - 1])
+            d2 = date.fromisoformat(dates[i])
+            if (d1 - d2).days == 1:
+                streak += 1
+            else:
+                break
+        streak_str = f"🔥 Серия активности: <b>{streak} дн.</b>\n" if streak > 1 else ""
     else:
-        rate = round(stats["total_success"] / (stats["msg_success"] + stats["peer_success"] + 1) * 100) if (stats["msg_success"] + stats["peer_success"]) > 0 else 0
-        total_sessions = stats["msg_count"] * 1 + stats["peer_count"] * 1
-        if total_sessions > 0:
-            rate = round((stats["msg_success"] + stats["peer_success"]) / total_sessions * 100)
-        else:
-            rate = 0
-        report_block = (
-            f"📨 <b>Жалобы на сообщения:</b> {stats['msg_count']} шт. (✅ {stats['msg_success']} успешно)\n"
-            f"📢 <b>Жалобы на каналы/группы:</b> {stats['peer_count']} шт. (✅ {stats['peer_success']} успешно)\n"
-            f"📊 <b>Всего обращений:</b> {stats['total']}\n"
+        streak_str = ""
+
+    # Бейджи за достижения
+    badges = []
+    if total >= 1:   badges.append("📨 Первое обращение")
+    if total >= 10:  badges.append("🎯 10 жалоб")
+    if total >= 50:  badges.append("⚡ 50 жалоб")
+    if total >= 100: badges.append("💪 100 жалоб")
+    if ref_count >= 1:  badges.append("👥 Реферер")
+    if ref_count >= 5:  badges.append("🌟 Топ-реферер")
+    if has_prem:         badges.append("💎 Premium")
+    if is_adm:           badges.append("🛡 Админ")
+    badges_str = ("🏆 <b>Значки:</b> " + "  ".join(badges) + "\n") if badges else ""
+
+    if total == 0:
+        body = "📭 Вы ещё не подавали обращений.\n\nПерешлите сообщение из любого канала или нажмите <b>📨 Подать обращение</b>."
+    else:
+        bar_filled = round(pct / 10)
+        bar = "█" * bar_filled + "░" * (10 - bar_filled)
+        body = (
+            f"💬 На сообщения: <b>{stats['msg_count']}</b>\n"
+            f"📢 На каналы / группы / ботов: <b>{stats['peer_count']}</b>\n"
+            f"📊 Всего: <b>{total}</b>\n"
+            f"✅ Успешность: [{bar}] <b>{pct}%</b>\n"
+            f"{streak_str}"
         )
 
     await message.answer(
         f"📊 <b>Ваша статистика</b>\n\n"
-        f"{report_block}\n"
-        f"👥 <b>Приглашено друзей:</b> {ref_count} чел. (+{ref_count * REFERRAL_BONUS_DAYS} дн. к подписке)",
-        parse_mode="HTML"
+        f"{badges_str}"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{body}"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👥 Приглашено друзей: <b>{ref_count}</b> чел.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 История обращений", callback_data="my:history"),
+             InlineKeyboardButton(text="🔥 Горячие цели",      callback_data="my:trending")],
+        ])
     )
 
 
@@ -589,16 +789,19 @@ async def btn_referral(message: Message):
     ref_link = f"https://t.me/{bot_info.username}?start=ref_{code}"
     await message.answer(
         f"👥 <b>Реферальная программа</b>\n\n"
-        f"Приглашайте друзей — за каждого нового пользователя вы получаете "
-        f"<b>+{REFERRAL_BONUS_DAYS} дней</b> подписки!\n\n"
-        f"🔗 <b>Ваша ссылка:</b>\n<code>{ref_link}</code>\n\n"
-        f"📌 Ссылка работает только для <b>новых</b> пользователей, которые ещё не регистрировались в боте.\n\n"
-        f"👤 <b>Приглашено:</b> {ref_count} чел.\n"
-        f"🎁 <b>Заработано:</b> {ref_count * REFERRAL_BONUS_DAYS} дней подписки",
+        f"🎁 <b>Как работает бонус:</b>\n"
+        f"1. Ваш друг переходит по ссылке и регистрируется\n"
+        f"2. Друг покупает подписку <b>минимум на 1 день</b>\n"
+        f"3. <b>Оба</b> автоматически получают <b>+{REFERRAL_BONUS_DAYS} день</b> подписки бесплатно!\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔗 <b>Ваша реферальная ссылка:</b>\n<code>{ref_link}</code>\n\n"
+        f"📌 Ссылка работает только для <b>новых</b> пользователей\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 <b>Приглашено друзей:</b> {ref_count} чел.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📤 Поделиться ссылкой",
-                                  url=f"https://t.me/share/url?url={ref_link}&text=Присоединяйся+к+нам!")]])
+                                  url=f"https://t.me/share/url?url={ref_link}&text=🔥+Крутой+сервис+для+верификации+контента%21+Регистрируйся+по+моей+ссылке:")]])
     )
 
 
@@ -618,26 +821,61 @@ async def btn_rules(message: Message):
 async def btn_my_sub(message: Message):
     uid = message.from_user.id
     if await db.is_admin(uid) or uid in SUPERADMIN_IDS:
-        await message.answer("👑 Администратор — подписка бессрочная."); return
+        await message.answer("👑 <b>Администратор</b>\n\n♾️ Подписка бессрочная\n💎 Premium доступ включён", parse_mode="HTML"); return
     user = await db.get_user(uid)
     if not user:
         await message.answer("Напишите /start"); return
+
+    has_prem = await db.has_active_premium(uid)
+    prem_badge = "\n💎 <b>Premium:</b> активен ✅" if has_prem else "\n💎 <b>Premium:</b> не активен"
+
     if user.get("subscription_lifetime"):
-        await message.answer("♾️ У вас <b>бессрочная подписка</b>!", parse_mode="HTML")
+        await message.answer(
+            f"♾️ <b>Бессрочная подписка</b>\n\n"
+            f"✅ Доступ: навсегда{prem_badge}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Купить Premium", callback_data="buy_premium")]
+            ]) if not has_prem else None
+        )
     elif user.get("subscription_end"):
         try:
             end = datetime.fromisoformat(user["subscription_end"]).replace(tzinfo=timezone.utc)
             now = datetime.now(timezone.utc)
             if end > now:
+                days_left = (end - now).days
+                hours_left = int((end - now).total_seconds() // 3600)
+                if days_left >= 1:
+                    time_str = f"{days_left} дн."
+                else:
+                    time_str = f"{hours_left} ч."
+                # Progress bar (max 30 days visual)
+                filled = min(10, max(1, days_left // 3))
+                bar = "█" * filled + "░" * (10 - filled)
                 await message.answer(
-                    f"✅ Подписка активна.\n📅 До: <b>{end.strftime('%d.%m.%Y %H:%M')} UTC</b>\n"
-                    f"⏳ Осталось: <b>{(end - now).days} дн.</b>", parse_mode="HTML")
+                    f"✅ <b>Подписка активна</b>\n\n"
+                    f"📅 До: <b>{end.strftime('%d.%m.%Y %H:%M')} UTC</b>\n"
+                    f"⏳ Осталось: <b>{time_str}</b>\n"
+                    f"[{bar}]{prem_badge}",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="💎 Купить Premium", callback_data="buy_premium")]
+                    ]) if not has_prem else None
+                )
             else:
-                await message.answer("❌ Подписка истекла. Купите новую.")
+                await message.answer(
+                    f"❌ <b>Подписка истекла</b>\n\nОформите новую подписку для продолжения работы.",
+                    parse_mode="HTML",
+                    reply_markup=await _buy_keyboard()
+                )
         except Exception:
             await message.answer("❌ Ошибка данных.")
     else:
-        await message.answer("❌ Нет подписки. Нажмите <b>💎 Купить подписку</b>.", parse_mode="HTML")
+        await message.answer(
+            "❌ <b>Нет активной подписки</b>\n\nВыберите тариф ниже:",
+            parse_mode="HTML",
+            reply_markup=await _buy_keyboard()
+        )
 
 
 async def _buy_keyboard() -> InlineKeyboardMarkup:
@@ -744,14 +982,86 @@ async def btn_report(message: Message, bot: Bot, state: FSMContext):
     )
 
 
+@router.message(F.forward_from_chat | F.forward_origin)
+async def handle_forwarded_global(message: Message, bot: Bot, state: FSMContext):
+    """Перехват любого пересланного сообщения — предлагаем быструю жалобу."""
+    uid = message.from_user.id
+    chat_id, msg_id, is_private = _extract_forward(message)
+    if not chat_id:
+        return  # не из канала/группы — игнорируем
+
+    # Узнаём имя исходника для кнопки
+    fc = getattr(message, "forward_from_chat", None)
+    src_title = (getattr(fc, "title", None) or getattr(fc, "username", None) or chat_id) if fc else chat_id
+
+    is_adm = await db.is_admin(uid) or uid in SUPERADMIN_IDS
+    if not is_adm:
+        if not await db.has_active_subscription(uid):
+            await message.answer("❌ Для подачи обращения нужна подписка.",
+                                  reply_markup=await _buy_keyboard()); return
+        now = datetime.now(timezone.utc)
+        last = user_last_report.get(uid)
+        if last and (now - last).total_seconds() < REPORT_COOLDOWN_SECONDS:
+            remain = int(REPORT_COOLDOWN_SECONDS - (now - last).total_seconds())
+            mins, secs = divmod(remain, 60)
+            await message.answer(
+                f"⏳ Кулдаун: повторите через <b>{mins} мин. {secs} сек.</b>",
+                parse_mode="HTML"); return
+
+    await state.update_data(chat_id=chat_id, message_id=msg_id)
+    await state.set_state(States.waiting_report_reason)
+    await message.answer(
+        f"⚡ <b>Быстрая жалоба</b>\n\n"
+        f"📌 Источник: <b>{src_title}</b>\n"
+        f"🔗 Пост: <code>{msg_id}</code>\n\n"
+        f"Выберите причину:",
+        parse_mode="HTML",
+        reply_markup=_reason_keyboard()
+    )
+
+
 @router.callback_query(F.data.startswith("rtype:"), States.waiting_report_type)
 async def cb_report_type(call: CallbackQuery, state: FSMContext):
     rtype = call.data.split(":")[1]
+    uid = call.from_user.id
+    is_adm = await db.is_admin(uid) or uid in SUPERADMIN_IDS
+
+    # Premium check: всё кроме жалоб на сообщения требует Premium
+    if rtype != "message" and not is_adm:
+        if not await db.has_active_premium(uid):
+            premium_price = await db.get_setting("premium_price") or "15"
+            has_sub = await db.has_active_subscription(uid)
+            if has_sub:
+                note = f"💰 Стоимость: <b>{premium_price} USDT</b> — навсегда (одноразовая покупка)"
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text=f"💎 Купить Premium — {premium_price} USDT", callback_data="buy_premium")],
+                    [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_report_type")],
+                ])
+            else:
+                note = "⚠️ Для покупки Premium сначала нужна активная обычная подписка."
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💎 Купить подписку", callback_data="goto_buy_sub")],
+                    [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_report_type")],
+                ])
+            icon = {"channel": "📢", "group": "👥", "bot": "🤖"}.get(rtype, "📢")
+            type_ru = {"channel": "каналы", "group": "группы", "bot": "ботов"}.get(rtype, "объекты")
+            await call.message.edit_text(
+                f"{icon} <b>Жалобы на {type_ru} — только Premium</b>\n\n"
+                f"Этот тип обращений доступен только для пользователей с Premium подпиской.\n\n"
+                f"{note}\n\n"
+                f"<i>Premium не отключается — покупается один раз навсегда (пока активна обычная подписка)</i>",
+                parse_mode="HTML",
+                reply_markup=kb
+            )
+            await call.answer()
+            return
+
     await state.update_data(peer_type=rtype)
     if rtype == "message":
         await state.set_state(States.waiting_report_link)
         await call.message.edit_text(
-            "🔗 Отправьте ссылку на публикацию:\n\n"
+            "🔗 <b>Жалоба на сообщение</b>\n\n"
+            "Отправьте ссылку на публикацию:\n"
             "• <code>https://t.me/username/123</code>\n\n"
             "⚠️ Ссылки на приватные каналы (<code>t.me/c/...</code>) не принимаются.",
             parse_mode="HTML")
@@ -760,8 +1070,8 @@ async def cb_report_type(call: CallbackQuery, state: FSMContext):
         await call.message.edit_text(
             "📢 <b>Жалоба на канал</b>\n\n"
             "Отправьте @юзернейм или ссылку:\n"
-            "• <code>@durov</code>\n• <code>https://t.me/durov</code>\n\n"
-            "ℹ️ Тип (канал/группа/бот) будет определён автоматически.",
+            "• <code>@channame</code>\n• <code>https://t.me/channame</code>\n\n"
+            "ℹ️ Тип объекта будет определён автоматически.",
             parse_mode="HTML")
     elif rtype == "group":
         await state.set_state(States.waiting_peer_username)
@@ -769,23 +1079,104 @@ async def cb_report_type(call: CallbackQuery, state: FSMContext):
             "👥 <b>Жалоба на группу</b>\n\n"
             "Отправьте @юзернейм или ссылку:\n"
             "• <code>@mygroup</code>\n• <code>https://t.me/mygroup</code>\n\n"
-            "ℹ️ Тип (канал/группа/бот) будет определён автоматически.",
+            "ℹ️ Тип объекта будет определён автоматически.",
             parse_mode="HTML")
     else:
         await state.set_state(States.waiting_peer_username)
         await call.message.edit_text(
             "🤖 <b>Жалоба на бота</b>\n\n"
             "Отправьте @юзернейм бота:\n• <code>@somebot</code>\n\n"
-            "ℹ️ Тип (канал/группа/бот) будет определён автоматически.",
+            "ℹ️ Тип объекта будет определён автоматически.",
             parse_mode="HTML")
     await call.answer()
+
+
+@router.callback_query(F.data == "back_to_report_type")
+async def cb_back_to_report_type(call: CallbackQuery, state: FSMContext):
+    await state.set_state(States.waiting_report_type)
+    await call.message.edit_text(
+        "📨 <b>Подать обращение</b>\n\nЧто вы хотите обжаловать?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💬 Сообщение / пост", callback_data="rtype:message")],
+            [InlineKeyboardButton(text="📢 Канал",            callback_data="rtype:channel")],
+            [InlineKeyboardButton(text="👥 Группа",           callback_data="rtype:group")],
+            [InlineKeyboardButton(text="🤖 Бот",              callback_data="rtype:bot")],
+        ])
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "goto_buy_sub")
+async def cb_goto_buy_sub(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("💎 Выберите тариф подписки:", reply_markup=await _buy_keyboard())
+    await call.answer()
+
+
+@router.callback_query(F.data == "buy_premium")
+async def cb_buy_premium(call: CallbackQuery):
+    uid = call.from_user.id
+    if await db.is_admin(uid) or uid in SUPERADMIN_IDS:
+        await call.answer("👑 У администраторов Premium уже активен!", show_alert=True); return
+    if not await db.has_active_subscription(uid):
+        await call.answer("❌ Сначала приобретите обычную подписку!", show_alert=True); return
+    if await db.has_active_premium(uid):
+        await call.answer("✅ Premium уже активен!", show_alert=True); return
+
+    premium_price_str = await db.get_setting("premium_price") or "15"
+    try:
+        premium_price = float(premium_price_str)
+    except ValueError:
+        premium_price = 15.0
+
+    await call.message.edit_text("⏳ Создаю счёт на Premium...")
+    try:
+        inv = await create_invoice(premium_price, 0, uid)
+        await db.add_premium_payment(uid, premium_price, inv["invoice_id"])
+        await call.message.edit_text(
+            f"💎 <b>Premium подписка</b>\n\n"
+            f"💰 Стоимость: <b>{premium_price:.0f} USDT</b> — навсегда\n\n"
+            f"✅ После оплаты Premium активируется автоматически.\n"
+            f"⚠️ Premium работает пока активна обычная подписка. При истечении обычной — Premium приостанавливается и возобновляется при продлении.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"💳 Оплатить {premium_price:.0f} USDT", url=inv["pay_url"])]
+            ]))
+    except Exception as e:
+        await call.message.edit_text(f"❌ Ошибка создания счёта: {e}")
+    await call.answer()
+
+
+def _extract_forward(message: Message):
+    """Вернуть (chat_id_str, msg_id_str, is_private) из пересланного сообщения или (None, None, False)."""
+    fc = getattr(message, "forward_from_chat", None)
+    fmid = getattr(message, "forward_from_message_id", None)
+    if fc and fmid:
+        username = getattr(fc, "username", None)
+        if username:
+            return username, str(fmid), False
+        # приватный канал / группа — числовой ID
+        return str(fc.id), str(fmid), True
+    return None, None, False
 
 
 @router.message(States.waiting_report_link)
 async def got_link(message: Message, state: FSMContext):
     uid = message.from_user.id
     is_adm = await db.is_admin(uid) or uid in SUPERADMIN_IDS
-    chat_id, msg_id, is_private = parse_tg_link(message.text.strip())
+
+    # Пересланное сообщение — извлекаем автоматически
+    if message.forward_from_chat or message.forward_origin:
+        chat_id, msg_id, is_private = _extract_forward(message)
+        if chat_id:
+            await message.answer("🔗 Ссылка извлечена из пересланного сообщения ✅")
+        else:
+            await message.answer("❌ Не удалось извлечь источник пересланного сообщения. Отправьте ссылку вручную."); return
+    else:
+        if not message.text:
+            await message.answer("❌ Отправьте ссылку на публикацию или перешлите сообщение."); return
+        chat_id, msg_id, is_private = parse_tg_link(message.text.strip())
 
     if not chat_id:
         await message.answer("❌ Неверный формат. Пример: https://t.me/username/123"); return
@@ -824,13 +1215,19 @@ async def got_link(message: Message, state: FSMContext):
 
     await state.update_data(chat_id=chat_id, message_id=msg_id)
     await state.set_state(States.waiting_report_reason)
-    await message.answer("📋 Выберите категорию нарушения:",
+    await message.answer(
+        f"📋 <b>Причина обращения</b>\n\n"
+        f"🔗 <code>t.me/{chat_id}/{msg_id}</code>\n\n"
+        f"Выберите категорию нарушения:",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🗑 Спам",              callback_data="reason:spam")],
-            [InlineKeyboardButton(text="🔪 Насилие",           callback_data="reason:violence")],
-            [InlineKeyboardButton(text="🔞 Порнография",       callback_data="reason:porn")],
-            [InlineKeyboardButton(text="❓ Другое",            callback_data="reason:other")],
-            [InlineKeyboardButton(text="✏️ Описать нарушение", callback_data="reason:custom")],
+            [InlineKeyboardButton(text="🗑 Спам",               callback_data="reason:spam"),
+             InlineKeyboardButton(text="🔪 Насилие",            callback_data="reason:violence")],
+            [InlineKeyboardButton(text="🔞 Порнография",        callback_data="reason:porn"),
+             InlineKeyboardButton(text="©️ Авт. права",         callback_data="reason:copyright")],
+            [InlineKeyboardButton(text="🎭 Фейк",               callback_data="reason:fake"),
+             InlineKeyboardButton(text="❓ Другое",             callback_data="reason:other")],
+            [InlineKeyboardButton(text="✏️ Описать своими словами", callback_data="reason:custom")],
         ]))
 
 
@@ -838,38 +1235,109 @@ async def got_link(message: Message, state: FSMContext):
 async def cb_reason_custom(call: CallbackQuery, state: FSMContext):
     await state.set_state(States.waiting_custom_text)
     await call.message.edit_text(
-        "✏️ Опишите нарушение своими словами:\n\n"
-        "<i>Например: «Контент нарушает правила сообщества»</i>",
+        "✏️ <b>Опишите нарушение своими словами</b>\n\n"
+        "<i>Например: «Публикует персональные данные», «Призывает к насилию»</i>\n\n"
+        "Максимум 512 символов:",
         parse_mode="HTML")
     await call.answer()
 
 
 @router.message(States.waiting_custom_text)
-async def got_custom_text(message: Message, state: FSMContext, bot: Bot):
+async def got_custom_text(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if not text:
         await message.answer("❌ Описание не может быть пустым."); return
     if len(text) > 512:
         await message.answer(f"❌ Слишком длинно ({len(text)} симв.). Максимум 512."); return
     data = await state.get_data()
-    await state.clear()
-    await message.answer(f"✅ Принято. Обрабатываю...\n\n📝 <i>{text[:100]}...</i>", parse_mode="HTML")
-    await _send_reports(bot=bot, user_id=message.from_user.id,
-        chat_id_str=data["chat_id"], msg_id_str=data["message_id"],
-        reason_name="✏️ Свой текст", reason_obj=InputReportReasonOther(),
-        custom_text=text, reply_target=message)
+    chat_id = data["chat_id"]
+    msg_id = data["message_id"]
+    await state.update_data(custom_text=text, reason_key="other", reason_name="✏️ Свой текст")
+    await state.set_state(States.waiting_confirm)
+    await message.answer(
+        f"📋 <b>Подтвердите обращение</b>\n\n"
+        f"🔗 Публикация: <code>t.me/{chat_id}/{msg_id}</code>\n"
+        f"📌 Причина: ✏️ <b>Свой текст</b>\n"
+        f"📝 Описание: <i>{text[:120]}{'...' if len(text) > 120 else ''}</i>\n\n"
+        f"⚠️ После подтверждения обращение будет отправлено через все сессии верификации.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Отправить жалобу", callback_data="confirm_report:yes")],
+            [InlineKeyboardButton(text="❌ Отмена",           callback_data="confirm_report:no")],
+        ])
+    )
 
 
 @router.callback_query(F.data.startswith("reason:"), States.waiting_report_reason)
-async def cb_reason(call: CallbackQuery, state: FSMContext, bot: Bot):
+async def cb_reason(call: CallbackQuery, state: FSMContext):
     key = call.data.split(":")[1]
-    reason_name, reason_obj = REPORT_REASONS[key]
+    reason_name, _ = REPORT_REASONS[key]
+    data = await state.get_data()
+    chat_id = data["chat_id"]
+    msg_id = data["message_id"]
+    await state.update_data(reason_key=key, reason_name=reason_name)
+    await state.set_state(States.waiting_confirm)
+    await call.message.edit_text(
+        f"📋 <b>Подтвердите обращение</b>\n\n"
+        f"🔗 Публикация: <code>t.me/{chat_id}/{msg_id}</code>\n"
+        f"📌 Причина: <b>{reason_name}</b>\n\n"
+        f"⚠️ После подтверждения жалоба будет отправлена через все сессии верификации.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Отправить жалобу", callback_data="confirm_report:yes")],
+            [InlineKeyboardButton(text="◀️ Изменить причину", callback_data="confirm_report:back")],
+            [InlineKeyboardButton(text="❌ Отмена",           callback_data="confirm_report:no")],
+        ])
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("confirm_report:"), States.waiting_confirm)
+async def cb_confirm_report(call: CallbackQuery, state: FSMContext, bot: Bot):
+    action = call.data.split(":")[1]
+    uid = call.from_user.id
+    is_adm = await db.is_admin(uid) or uid in SUPERADMIN_IDS
+
+    if action == "no":
+        await state.clear()
+        await call.message.edit_text("❌ Обращение отменено.")
+        await bot.send_message(uid, "Главное меню:", reply_markup=await get_main_keyboard(uid, is_adm))
+        await call.answer(); return
+
+    if action == "back":
+        data = await state.get_data()
+        chat_id = data.get("chat_id", "")
+        msg_id = data.get("message_id", "")
+        await state.set_state(States.waiting_report_reason)
+        await call.message.edit_text(
+            f"📋 <b>Причина обращения</b>\n\n"
+            f"🔗 <code>t.me/{chat_id}/{msg_id}</code>\n\n"
+            f"Выберите категорию нарушения:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🗑 Спам",               callback_data="reason:spam"),
+                 InlineKeyboardButton(text="🔪 Насилие",            callback_data="reason:violence")],
+                [InlineKeyboardButton(text="🔞 Порнография",        callback_data="reason:porn"),
+                 InlineKeyboardButton(text="©️ Авт. права",         callback_data="reason:copyright")],
+                [InlineKeyboardButton(text="🎭 Фейк",               callback_data="reason:fake"),
+                 InlineKeyboardButton(text="❓ Другое",             callback_data="reason:other")],
+                [InlineKeyboardButton(text="✏️ Описать своими словами", callback_data="reason:custom")],
+            ])
+        )
+        await call.answer(); return
+
     data = await state.get_data()
     await state.clear()
+    key = data.get("reason_key", "other")
+    reason_name, reason_obj = REPORT_REASONS.get(key, REPORT_REASONS["other"])
+    custom_text = data.get("custom_text", "")
     await call.answer()
-    await _send_reports(bot=bot, user_id=call.from_user.id,
+    await _send_reports(
+        bot=bot, user_id=uid,
         chat_id_str=data["chat_id"], msg_id_str=data["message_id"],
-        reason_name=reason_name, reason_obj=reason_obj, call=call)
+        reason_name=reason_name, reason_obj=reason_obj,
+        custom_text=custom_text, call=call
+    )
 
 
 # ─── Peer-репорты (канал / бот) ─────────────────────────────
@@ -948,51 +1416,130 @@ async def got_peer_username(message: Message, state: FSMContext):
     await state.update_data(peer_username=uname)
     await state.set_state(States.waiting_peer_reason)
     icon = TYPE_ICONS.get(peer_type, "📢")
+    type_label = {"channel": "Канал", "group": "Группа", "bot": "Бот", "user": "Пользователь"}.get(peer_type, "Объект")
     await message.answer(
-        f"{icon} <code>@{uname}</code>\n\n📋 Выберите причину обращения:",
+        f"{icon} <b>{type_label}: <code>@{uname}</code></b>\n\n"
+        f"📋 Выберите причину обращения:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🗑 Спам",              callback_data="preason:spam")],
-            [InlineKeyboardButton(text="🔪 Насилие",           callback_data="preason:violence")],
-            [InlineKeyboardButton(text="🔞 Порнография",       callback_data="preason:porn")],
-            [InlineKeyboardButton(text="❓ Другое",            callback_data="preason:other")],
-            [InlineKeyboardButton(text="✏️ Описать нарушение", callback_data="preason:custom")],
+            [InlineKeyboardButton(text="🗑 Спам",               callback_data="preason:spam"),
+             InlineKeyboardButton(text="🔪 Насилие",            callback_data="preason:violence")],
+            [InlineKeyboardButton(text="🔞 Порнография",        callback_data="preason:porn"),
+             InlineKeyboardButton(text="©️ Авт. права",         callback_data="preason:copyright")],
+            [InlineKeyboardButton(text="🎭 Фейк",               callback_data="preason:fake"),
+             InlineKeyboardButton(text="❓ Другое",             callback_data="preason:other")],
+            [InlineKeyboardButton(text="✏️ Описать своими словами", callback_data="preason:custom")],
         ]))
 
 
 @router.callback_query(F.data == "preason:custom", States.waiting_peer_reason)
 async def cb_peer_reason_custom(call: CallbackQuery, state: FSMContext):
     await state.set_state(States.waiting_peer_custom)
-    await call.message.edit_text("✏️ Опишите нарушение своими словами (до 512 символов):", parse_mode="HTML")
+    await call.message.edit_text(
+        "✏️ <b>Опишите нарушение своими словами</b>\n\n"
+        "<i>Например: «Распространяет мошеннические схемы», «Нарушает авторские права»</i>\n\n"
+        "Максимум 512 символов:",
+        parse_mode="HTML")
     await call.answer()
 
 
 @router.message(States.waiting_peer_custom)
-async def got_peer_custom(message: Message, state: FSMContext, bot: Bot):
+async def got_peer_custom(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if not text:
         await message.answer("❌ Описание не может быть пустым."); return
     if len(text) > 512:
         await message.answer(f"❌ Слишком длинно ({len(text)} симв.). Максимум 512."); return
     data = await state.get_data()
-    await state.clear()
-    await message.answer(f"✅ Принято. Обрабатываю...\n\n📝 <i>{text[:100]}...</i>", parse_mode="HTML")
-    await _send_peer_reports(bot=bot, user_id=message.from_user.id,
-        peer_username=data["peer_username"], peer_type=data.get("peer_type", "channel"),
-        reason_name="✏️ Свой текст", reason_obj=InputReportReasonOther(),
-        custom_text=text, reply_target=message)
+    peer_username = data.get("peer_username", "")
+    peer_type = data.get("peer_type", "channel")
+    icon = TYPE_ICONS.get(peer_type, "📢")
+    await state.update_data(custom_text=text, reason_key="other", reason_name="✏️ Свой текст")
+    await state.set_state(States.waiting_peer_confirm)
+    await message.answer(
+        f"📋 <b>Подтвердите обращение</b>\n\n"
+        f"{icon} Объект: <code>@{peer_username}</code>\n"
+        f"📌 Причина: ✏️ <b>Свой текст</b>\n"
+        f"📝 Описание: <i>{text[:120]}{'...' if len(text) > 120 else ''}</i>\n\n"
+        f"⚠️ После подтверждения жалоба будет отправлена через все сессии верификации.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Отправить жалобу", callback_data="confirm_peer:yes")],
+            [InlineKeyboardButton(text="❌ Отмена",           callback_data="confirm_peer:no")],
+        ])
+    )
 
 
 @router.callback_query(F.data.startswith("preason:"), States.waiting_peer_reason)
-async def cb_peer_reason(call: CallbackQuery, state: FSMContext, bot: Bot):
+async def cb_peer_reason(call: CallbackQuery, state: FSMContext):
     key = call.data.split(":")[1]
-    reason_name, reason_obj = REPORT_REASONS[key]
+    reason_name, _ = REPORT_REASONS[key]
+    data = await state.get_data()
+    peer_username = data.get("peer_username", "")
+    peer_type = data.get("peer_type", "channel")
+    icon = TYPE_ICONS.get(peer_type, "📢")
+    await state.update_data(reason_key=key, reason_name=reason_name)
+    await state.set_state(States.waiting_peer_confirm)
+    await call.message.edit_text(
+        f"📋 <b>Подтвердите обращение</b>\n\n"
+        f"{icon} Объект: <code>@{peer_username}</code>\n"
+        f"📌 Причина: <b>{reason_name}</b>\n\n"
+        f"⚠️ После подтверждения жалоба будет отправлена через все сессии верификации.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Отправить жалобу", callback_data="confirm_peer:yes")],
+            [InlineKeyboardButton(text="◀️ Изменить причину", callback_data="confirm_peer:back")],
+            [InlineKeyboardButton(text="❌ Отмена",           callback_data="confirm_peer:no")],
+        ])
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("confirm_peer:"), States.waiting_peer_confirm)
+async def cb_confirm_peer_report(call: CallbackQuery, state: FSMContext, bot: Bot):
+    action = call.data.split(":")[1]
+    uid = call.from_user.id
+    is_adm = await db.is_admin(uid) or uid in SUPERADMIN_IDS
+
+    if action == "no":
+        await state.clear()
+        await call.message.edit_text("❌ Обращение отменено.")
+        await bot.send_message(uid, "Главное меню:", reply_markup=await get_main_keyboard(uid, is_adm))
+        await call.answer(); return
+
+    if action == "back":
+        data = await state.get_data()
+        peer_username = data.get("peer_username", "")
+        peer_type = data.get("peer_type", "channel")
+        icon = TYPE_ICONS.get(peer_type, "📢")
+        await state.set_state(States.waiting_peer_reason)
+        await call.message.edit_text(
+            f"{icon} <code>@{peer_username}</code>\n\n📋 Выберите причину обращения:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🗑 Спам",               callback_data="preason:spam"),
+                 InlineKeyboardButton(text="🔪 Насилие",            callback_data="preason:violence")],
+                [InlineKeyboardButton(text="🔞 Порнография",        callback_data="preason:porn"),
+                 InlineKeyboardButton(text="©️ Авт. права",         callback_data="preason:copyright")],
+                [InlineKeyboardButton(text="🎭 Фейк",               callback_data="preason:fake"),
+                 InlineKeyboardButton(text="❓ Другое",             callback_data="preason:other")],
+                [InlineKeyboardButton(text="✏️ Описать своими словами", callback_data="preason:custom")],
+            ])
+        )
+        await call.answer(); return
+
     data = await state.get_data()
     await state.clear()
+    key = data.get("reason_key", "other")
+    reason_name, reason_obj = REPORT_REASONS.get(key, REPORT_REASONS["other"])
+    custom_text = data.get("custom_text", "")
     await call.answer()
-    await _send_peer_reports(bot=bot, user_id=call.from_user.id,
+    await _send_peer_reports(
+        bot=bot, user_id=uid,
         peer_username=data["peer_username"], peer_type=data.get("peer_type", "channel"),
-        reason_name=reason_name, reason_obj=reason_obj, call=call)
+        reason_name=reason_name, reason_obj=reason_obj,
+        custom_text=custom_text, call=call
+    )
 
 
 # ─── Отправка репортов ──────────────────────────────────────
@@ -1004,6 +1551,7 @@ async def _send_peer_reports(bot: Bot, user_id: int, peer_username: str, peer_ty
     sessions = await db.get_all_sessions()
     icon = TYPE_ICONS.get(peer_type, "📢")
     type_ru = {"channel": "канал", "group": "группу", "bot": "бота", "user": "пользователя"}.get(peer_type, "объект")
+    report_id = _generate_report_id()
 
     if not sessions:
         txt = "❌ Нет активных сессий. Обратитесь к администратору."
@@ -1013,13 +1561,20 @@ async def _send_peer_reports(bot: Bot, user_id: int, peer_username: str, peer_ty
         return
 
     total = len(sessions)
+    spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     if call:
-        await call.message.edit_text(f"⏳ Обрабатываю обращение на {icon} @{peer_username}...")
-        status_msg = await call.message.answer(f"⏳ Верифицирую... (0/{total})")
+        await call.message.edit_text(
+            f"🔄 <b>Обработка жалобы…</b>\n\n"
+            f"{icon} <code>@{peer_username}</code>\n"
+            f"📌 {reason_name}\n\n"
+            f"⏳ Запускаю верификацию через {total} сессий…",
+            parse_mode="HTML")
+        status_msg = await call.message.answer(f"⏳ Верифицирую… (0/{total})")
     else:
-        status_msg = await reply_target.answer(f"⏳ Верифицирую... (0/{total})")
+        status_msg = await reply_target.answer(f"⏳ Верифицирую… (0/{total})")
 
     success = errors = 0
+    flood_wait = False
     for i, sess in enumerate(sessions, 1):
         client = None
         try:
@@ -1027,13 +1582,19 @@ async def _send_peer_reports(bot: Bot, user_id: int, peer_username: str, peer_ty
             await asyncio.wait_for(client.connect(), timeout=15.0)
             if await asyncio.wait_for(client.is_user_authorized(), timeout=10.0):
                 try:
-                    peer = await asyncio.wait_for(client.get_input_entity(peer_username), timeout=10.0)
+                    # get_entity более надёжен чем get_input_entity для ботов и пользователей
+                    entity = await asyncio.wait_for(client.get_entity(peer_username), timeout=10.0)
+                    peer = await client.get_input_entity(entity)
                     await asyncio.wait_for(
                         client(ReportPeerRequest(peer=peer, reason=reason_obj, message=custom_text)),
                         timeout=15.0)
                     success += 1
+                except FloodWaitError as e:
+                    logger.warning(f"Peer-сессия {sess['id']} FloodWait {e.seconds}s")
+                    flood_wait = True
+                    errors += 1
                 except Exception as e:
-                    logger.warning(f"Peer-сессия {sess['id']}: {e}")
+                    logger.warning(f"Peer-сессия {sess['id']}: {type(e).__name__}: {e}")
                     errors += 1
             else:
                 errors += 1
@@ -1044,22 +1605,30 @@ async def _send_peer_reports(bot: Bot, user_id: int, peer_username: str, peer_ty
             if client:
                 try: await client.disconnect()
                 except Exception: pass
-        await asyncio.sleep(random.uniform(0.3, 0.7))
-        try: await status_msg.edit_text(f"⏳ Верифицирую... ({i}/{total})")
-        except Exception: pass
+        await asyncio.sleep(random.uniform(0.4, 0.8))
+        spin = spinner[i % len(spinner)]
+        try:
+            await status_msg.edit_text(
+                f"{spin} Верифицирую… ({i}/{total})  ✅{success} ❌{errors}")
+        except Exception:
+            pass
 
-    await db.add_peer_report_log(user_id, peer_username, peer_type, success, total)
+    await db.add_peer_report_log(user_id, peer_username, peer_type, success, total, report_id, reason_name)
     if not is_adm:
         user_last_report[user_id] = datetime.now(timezone.utc)
 
-    marks = "✅ " * min(success, 20) + "❌ " * min(errors, 20)
-    extra = f"\n\n📝 <i>{custom_text[:80]}{'...' if len(custom_text)>80 else ''}</i>" if custom_text else ""
+    pct = round(success / total * 100) if total > 0 else 0
+    bar_filled = round(pct / 10)
+    bar = "█" * bar_filled + "░" * (10 - bar_filled)
+    extra = f"\n📝 <i>{custom_text[:80]}{'…' if len(custom_text) > 80 else ''}</i>" if custom_text else ""
+    flood_note = "\n\n⚠️ <i>Некоторые аккаунты временно ограничены (FloodWait). Повторите позже для лучшего результата.</i>" if flood_wait else ""
     result_text = (
         f"📊 <b>Обращение обработано</b>\n\n"
         f"{icon} Объект: <code>@{peer_username}</code>\n"
         f"📌 Причина: {reason_name}{extra}\n\n"
-        f"🔁 Каналов верификации: <b>{total}</b>\n"
-        f"✅ Принято: <b>{success}</b>\n❌ Отклонено: <b>{errors}</b>\n\n{marks}"
+        f"[{bar}] {pct}%\n"
+        f"✅ Принято: <b>{success}</b> из <b>{total}</b>{flood_note}\n\n"
+        f"🆔 ID обращения: <code>{report_id}</code>"
     )
     await status_msg.edit_text(result_text, parse_mode="HTML")
 
@@ -1067,15 +1636,15 @@ async def _send_peer_reports(bot: Bot, user_id: int, peer_username: str, peer_ty
     user_obj = await db.get_user(user_id)
     uname_str = f"@{user_obj['username']}" if user_obj and user_obj.get("username") else f"id:{user_id}"
     log_text = (
-        f"{icon} <b>Жалоба на {type_ru}</b>\n\n"
+        f"{icon} <b>Жалоба на {type_ru}</b>  |  <code>{report_id}</code>\n\n"
         f"👤 От: {uname_str} (<code>{user_id}</code>)\n"
         f"🎯 Цель: <code>@{peer_username}</code>\n"
         f"📌 Причина: {reason_name}{extra}\n"
-        f"✅ Принято: <b>{success}</b> / {total}"
+        f"✅ Принято: <b>{success}</b> / {total}  ({pct}%)"
     )
     await _send_to_log_group(bot, log_text)
 
-    await bot.send_message(user_id, "Главное меню:", reply_markup=await get_main_keyboard(user_id, is_adm))
+    await bot.send_message(user_id, "📨 Главное меню:", reply_markup=await get_main_keyboard(user_id, is_adm))
 
 
 async def _send_reports(bot: Bot, user_id: int, chat_id_str: str, msg_id_str: str,
@@ -1083,6 +1652,7 @@ async def _send_reports(bot: Bot, user_id: int, chat_id_str: str, msg_id_str: st
                         reply_target=None, call=None):
     is_adm = await db.is_admin(user_id) or user_id in SUPERADMIN_IDS
     sessions = await db.get_all_sessions()
+    report_id = _generate_report_id()
 
     if not sessions:
         txt = "❌ Нет активных сессий. Обратитесь к администратору."
@@ -1092,13 +1662,23 @@ async def _send_reports(bot: Bot, user_id: int, chat_id_str: str, msg_id_str: st
         return
 
     total = len(sessions)
+    spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    target_link = (f"t.me/{chat_id_str}/{msg_id_str}"
+                   if not chat_id_str.lstrip("-").isdigit()
+                   else f"t.me/c/{str(chat_id_str).lstrip('-').lstrip('100')}/{msg_id_str}")
     if call:
-        await call.message.edit_text(f"⏳ Обрабатываю ({reason_name})...")
-        status_msg = await call.message.answer(f"⏳ Верифицирую... (0/{total})")
+        await call.message.edit_text(
+            f"🔄 <b>Обработка жалобы…</b>\n\n"
+            f"🔗 <code>{target_link}</code>\n"
+            f"📌 {reason_name}\n\n"
+            f"⏳ Запускаю верификацию через {total} сессий…",
+            parse_mode="HTML")
+        status_msg = await call.message.answer(f"⏳ Верифицирую… (0/{total})")
     else:
-        status_msg = await reply_target.answer(f"⏳ Верифицирую... (0/{total})")
+        status_msg = await reply_target.answer(f"⏳ Верифицирую… (0/{total})")
 
     success = errors = 0
+    flood_wait = False
     for i, sess in enumerate(sessions, 1):
         client = None
         try:
@@ -1106,15 +1686,23 @@ async def _send_reports(bot: Bot, user_id: int, chat_id_str: str, msg_id_str: st
             await asyncio.wait_for(client.connect(), timeout=15.0)
             if await asyncio.wait_for(client.is_user_authorized(), timeout=10.0):
                 try:
-                    peer = await asyncio.wait_for(client.get_input_entity(
-                        int(chat_id_str) if chat_id_str.lstrip("-").isdigit() else chat_id_str),
-                        timeout=10.0)
+                    chat_id_resolved = (int(chat_id_str)
+                                        if chat_id_str.lstrip("-").isdigit()
+                                        else chat_id_str)
+                    entity = await asyncio.wait_for(
+                        client.get_entity(chat_id_resolved), timeout=10.0)
+                    peer = await client.get_input_entity(entity)
                     await asyncio.wait_for(
-                        client(ReportRequest(peer=peer, id=[int(msg_id_str)], reason=reason_obj, message=custom_text)),
+                        client(ReportRequest(peer=peer, id=[int(msg_id_str)],
+                                             reason=reason_obj, message=custom_text)),
                         timeout=15.0)
                     success += 1
+                except FloodWaitError as e:
+                    logger.warning(f"Сессия {sess['id']} FloodWait {e.seconds}s")
+                    flood_wait = True
+                    errors += 1
                 except Exception as e:
-                    logger.warning(f"Сессия {sess['id']}: {e}")
+                    logger.warning(f"Сессия {sess['id']}: {type(e).__name__}: {e}")
                     errors += 1
             else:
                 errors += 1
@@ -1125,38 +1713,46 @@ async def _send_reports(bot: Bot, user_id: int, chat_id_str: str, msg_id_str: st
             if client:
                 try: await client.disconnect()
                 except Exception: pass
-        await asyncio.sleep(random.uniform(0.3, 0.7))
-        try: await status_msg.edit_text(f"⏳ Верифицирую... ({i}/{total})")
-        except Exception: pass
+        await asyncio.sleep(random.uniform(0.4, 0.8))
+        spin = spinner[i % len(spinner)]
+        try:
+            await status_msg.edit_text(
+                f"{spin} Верифицирую… ({i}/{total})  ✅{success} ❌{errors}")
+        except Exception:
+            pass
 
-    await db.add_report_log(user_id, chat_id_str, msg_id_str, success, total)
+    await db.add_report_log(user_id, chat_id_str, msg_id_str, success, total, report_id, reason_name)
     if not is_adm:
         user_last_report[user_id] = datetime.now(timezone.utc)
 
-    marks = "✅ " * min(success, 20) + "❌ " * min(errors, 20)
-    extra = f"\n\n📝 <i>{custom_text[:80]}{'...' if len(custom_text)>80 else ''}</i>" if custom_text else ""
+    pct = round(success / total * 100) if total > 0 else 0
+    bar_filled = round(pct / 10)
+    bar = "█" * bar_filled + "░" * (10 - bar_filled)
+    extra = f"\n📝 <i>{custom_text[:80]}{'…' if len(custom_text) > 80 else ''}</i>" if custom_text else ""
+    flood_note = "\n\n⚠️ <i>Некоторые аккаунты временно ограничены (FloodWait). Повторите позже для лучшего результата.</i>" if flood_wait else ""
     result_text = (
         f"📊 <b>Обращение обработано</b>\n\n"
-        f"📌 Категория: {reason_name}{extra}\n\n"
-        f"🔁 Каналов верификации: <b>{total}</b>\n"
-        f"✅ Принято: <b>{success}</b>\n❌ Отклонено: <b>{errors}</b>\n\n{marks}"
+        f"🔗 Публикация: <code>{target_link}</code>\n"
+        f"📌 Причина: {reason_name}{extra}\n\n"
+        f"[{bar}] {pct}%\n"
+        f"✅ Принято: <b>{success}</b> из <b>{total}</b>{flood_note}\n\n"
+        f"🆔 ID обращения: <code>{report_id}</code>"
     )
     await status_msg.edit_text(result_text, parse_mode="HTML")
 
     # Отправка в группу логов
     user_obj = await db.get_user(user_id)
     uname_str = f"@{user_obj['username']}" if user_obj and user_obj.get("username") else f"id:{user_id}"
-    target_link = f"t.me/{chat_id_str}/{msg_id_str}" if not chat_id_str.lstrip('-').isdigit() else f"t.me/c/{chat_id_str.lstrip('-100')}/{msg_id_str}"
     log_text = (
-        f"💬 <b>Жалоба на сообщение</b>\n\n"
+        f"💬 <b>Жалоба на сообщение</b>  |  <code>{report_id}</code>\n\n"
         f"👤 От: {uname_str} (<code>{user_id}</code>)\n"
         f"🔗 Цель: <code>{target_link}</code>\n"
         f"📌 Причина: {reason_name}{extra}\n"
-        f"✅ Принято: <b>{success}</b> / {total}"
+        f"✅ Принято: <b>{success}</b> / {total}  ({pct}%)"
     )
     await _send_to_log_group(bot, log_text)
 
-    await bot.send_message(user_id, "Главное меню:", reply_markup=await get_main_keyboard(user_id, is_adm))
+    await bot.send_message(user_id, "📨 Главное меню:", reply_markup=await get_main_keyboard(user_id, is_adm))
 
 
 # ─── Админ-панель ──────────────────────────────────────────
@@ -1202,10 +1798,21 @@ async def cb_export_db(call: CallbackQuery):
 async def cb_sessions(call: CallbackQuery):
     if not (await db.is_admin(call.from_user.id) or call.from_user.id in SUPERADMIN_IDS):
         await call.answer("❌ Нет доступа", show_alert=True); return
-    n = len(await db.get_all_sessions())
+    sessions = await db.get_all_sessions()
+    n = len(sessions)
+    if _session_status and sessions:
+        lines = []
+        for s in sessions:
+            status = _session_status.get(s["id"], "❓ не проверена")
+            lines.append(f"• #{s['id']} — {status}")
+        sess_list = "\n".join(lines)
+        sess_info = f"\n\n<b>Сессии:</b>\n{sess_list}"
+    else:
+        sess_info = "\n\n<i>Нажмите «Проверить все» для просмотра статусов.</i>"
     await call.message.edit_text(
-        f"📂 <b>Управление сессиями</b>\n\nАктивных сессий: <b>{n}</b>\n\n"
-        f"Для добавления StringSession вставьте строку после нажатия соответствующей кнопки.",
+        f"📂 <b>Управление сессиями</b>\n\n"
+        f"Активных сессий: <b>{n}</b>{sess_info}\n\n"
+        f"<b>Добавить сессию:</b> StringSession (строка) или авторизация по номеру телефона.",
         parse_mode="HTML",
         reply_markup=sessions_kb())
     await call.answer()
@@ -1689,20 +2296,33 @@ async def got_wl_target(message: Message, state: FSMContext):
     raw = (message.text or "").strip()
     m = re.match(r"https?://t\.me/([A-Za-z0-9_]{4,})", raw)
     target = m.group(1) if m else (raw[1:] if raw.startswith("@") else raw)
-    if not target:
-        await message.answer("❌ Не могу распознать."); return
-    await state.update_data(wl_target=target)
-    await state.set_state(States.waiting_wl_type)
-    await message.answer(f"✅ Объект: <code>{target}</code>\n\nВыберите тип:", parse_mode="HTML",
-                         reply_markup=whitelist_type_kb())
-
-
-@router.callback_query(F.data.startswith("wltype:"), States.waiting_wl_type)
-async def cb_wl_type(call: CallbackQuery, state: FSMContext):
-    wtype = call.data.split(":")[1]
-    data = await state.get_data()
-    target = data["wl_target"]
+    if not target or len(target) < 3:
+        await message.answer("❌ Не могу распознать. Введите @username или ссылку."); return
     await state.clear()
+    # Храним target в callback data — не зависим от состояния FSM
+    type_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Пользователь", callback_data=f"wlsave:{target}:user")],
+        [InlineKeyboardButton(text="🤖 Бот",          callback_data=f"wlsave:{target}:bot")],
+        [InlineKeyboardButton(text="📢 Канал",        callback_data=f"wlsave:{target}:channel")],
+        [InlineKeyboardButton(text="👥 Группа",       callback_data=f"wlsave:{target}:group")],
+        [InlineKeyboardButton(text="◀️ Отмена",       callback_data="admin:whitelist")],
+    ])
+    await message.answer(
+        f"✅ Объект: <code>{target}</code>\n\nВыберите тип:",
+        parse_mode="HTML",
+        reply_markup=type_kb
+    )
+
+
+@router.callback_query(F.data.startswith("wlsave:"))
+async def cb_wl_save(call: CallbackQuery):
+    if not (await db.is_admin(call.from_user.id) or call.from_user.id in SUPERADMIN_IDS):
+        await call.answer("❌ Нет доступа", show_alert=True); return
+    parts = call.data.split(":")
+    if len(parts) < 3:
+        await call.answer("❌ Ошибка данных", show_alert=True); return
+    target = parts[1]
+    wtype = parts[2]
     added = await db.add_to_whitelist(target, wtype, call.from_user.id)
     if added:
         await db.log_admin_action(call.from_user.id, "whitelist_add", f"target={target} type={wtype}")
@@ -1713,8 +2333,8 @@ async def cb_wl_type(call: CallbackQuery, state: FSMContext):
             parse_mode="HTML", reply_markup=whitelist_main_kb())
     else:
         await call.message.edit_text(
-            f"⚠️ <code>@{target}</code> уже в белом списке.", parse_mode="HTML",
-            reply_markup=whitelist_main_kb())
+            f"⚠️ <code>@{target}</code> уже в белом списке.",
+            parse_mode="HTML", reply_markup=whitelist_main_kb())
     await call.answer()
 
 
@@ -2330,6 +2950,46 @@ async def got_rules_url(message: Message, state: FSMContext):
     await db.set_setting("rules_url", message.text.strip())
     await state.clear()
     await message.answer("✅ URL правил обновлён.")
+
+
+# ─── Цена Premium (админ) ───────────────────────────────────
+
+@router.callback_query(F.data == "admin:premium_price")
+async def cb_premium_price(call: CallbackQuery, state: FSMContext):
+    if not (await db.is_admin(call.from_user.id) or call.from_user.id in SUPERADMIN_IDS):
+        await call.answer("❌ Нет доступа", show_alert=True); return
+    current = await db.get_setting("premium_price") or "15"
+    await state.set_state(States.waiting_premium_price)
+    await call.message.edit_text(
+        f"💎 <b>Цена Premium подписки</b>\n\n"
+        f"Текущая цена: <b>{current} USDT</b> (навсегда)\n\n"
+        f"Введите новую цену в USDT (например: <code>15</code> или <code>9.99</code>):\n\n"
+        f"<i>Premium — одноразовая покупка, действует пока активна обычная подписка.</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data="admin:back")]
+        ])
+    )
+    await call.answer()
+
+
+@router.message(States.waiting_premium_price)
+async def got_premium_price(message: Message, state: FSMContext):
+    if not (await db.is_admin(message.from_user.id) or message.from_user.id in SUPERADMIN_IDS):
+        await state.clear(); return
+    try:
+        price = float(message.text.strip().replace(",", "."))
+        if price <= 0: raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите положительное число (например: 15 или 9.99):"); return
+    await db.set_setting("premium_price", str(price))
+    await db.log_admin_action(message.from_user.id, "set_premium_price", f"price={price}")
+    await state.clear()
+    await message.answer(
+        f"✅ <b>Цена Premium обновлена!</b>\n\n💰 Новая цена: <b>{price:.2f} USDT</b>",
+        parse_mode="HTML",
+        reply_markup=admin_kb(message.from_user.id in SUPERADMIN_IDS)
+    )
 
 
 # ─── Статистика бота (админ) ───────────────────────────────
