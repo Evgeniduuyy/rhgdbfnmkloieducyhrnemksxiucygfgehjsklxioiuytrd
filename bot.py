@@ -18,7 +18,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BufferedInputFile, CallbackQuery, FSInputFile,
     InlineKeyboardButton, InlineKeyboardMarkup,
-    KeyboardButton, Message, ReplyKeyboardMarkup
+    KeyboardButton, LabeledPrice, Message, PreCheckoutQuery, ReplyKeyboardMarkup
 )
 from telethon import TelegramClient
 from telethon.errors import (
@@ -34,7 +34,7 @@ from telethon.tl.types import (
     InputReportReasonCopyright, InputReportReasonFake,
     Channel, Chat, User
 )
-from telethon.sessions import StringSession
+from telethon.sessions import StringSession, MemorySession
 
 import database as db
 
@@ -118,6 +118,8 @@ class States(StatesGroup):
     waiting_peer_confirm   = State()
     # Сессии
     waiting_session_string = State()
+    waiting_auth_key_hex   = State()
+    waiting_auth_key_dc    = State()
     waiting_phone          = State()
     waiting_code           = State()
     waiting_2fa            = State()
@@ -150,6 +152,11 @@ class States(StatesGroup):
     waiting_revoke_reason  = State()
     # Premium цена (для админа)
     waiting_premium_price  = State()
+    # Бан, Stars
+    waiting_ban_uid        = State()
+    waiting_ban_reason     = State()
+    waiting_unban_uid      = State()
+    waiting_stars_price    = State()
 
 
 # ─── Утилиты ───────────────────────────────────────────────
@@ -280,6 +287,9 @@ def admin_kb(is_superadmin: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🛡 Белый список",          callback_data="admin:whitelist")],
         [InlineKeyboardButton(text="📊 Группа логов",          callback_data="admin:log_group"),
          InlineKeyboardButton(text="❌ Снять подписку",        callback_data="admin:revoke_sub")],
+        [InlineKeyboardButton(text="🚫 Чёрный список",         callback_data="admin:banned"),
+         InlineKeyboardButton(text="⭐ Stars тарифы",          callback_data="admin:stars")],
+        [InlineKeyboardButton(text="🏆 Топ рефереров",         callback_data="admin:ref_leaderboard")],
         [InlineKeyboardButton(text="📈 Статистика бота",       callback_data="admin:stats")],
         [InlineKeyboardButton(text="📤 Выгрузить базу данных", callback_data="admin:export_db")],
     ]
@@ -290,11 +300,12 @@ def admin_kb(is_superadmin: bool = False) -> InlineKeyboardMarkup:
 
 def sessions_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Вставить StringSession",  callback_data="sess:upload")],
-        [InlineKeyboardButton(text="📱 Авторизоваться по номеру", callback_data="sess:phone")],
-        [InlineKeyboardButton(text="🗑 Удалить сессию",          callback_data="sess:delete")],
-        [InlineKeyboardButton(text="✅ Проверить все сессии",    callback_data="sess:check")],
-        [InlineKeyboardButton(text="◀️ Назад",                   callback_data="admin:back")],
+        [InlineKeyboardButton(text="📝 Вставить StringSession",    callback_data="sess:upload")],
+        [InlineKeyboardButton(text="🔑 Добавить Auth Key (HEX)",   callback_data="sess:authkey")],
+        [InlineKeyboardButton(text="📱 Авторизоваться по номеру",  callback_data="sess:phone")],
+        [InlineKeyboardButton(text="🗑 Удалить сессию",            callback_data="sess:delete")],
+        [InlineKeyboardButton(text="✅ Проверить все сессии",      callback_data="sess:check")],
+        [InlineKeyboardButton(text="◀️ Назад",                     callback_data="admin:back")],
     ])
 
 
@@ -445,7 +456,10 @@ async def _check_sessions_with_timeout() -> tuple[list[int], list[str]]:
             if ok:
                 me = await asyncio.wait_for(client.get_me(), timeout=10.0)
                 name = f"@{me.username}" if me.username else str(me.id)
-                _session_status[s["id"]] = f"✅ {name}"
+                sp = int(s.get("success_reports", 0) or 0)
+                tp = int(s.get("total_reports", 0) or 0)
+                rate_str = f" ({round(sp/tp*100)}%)" if tp > 0 else ""
+                _session_status[s["id"]] = f"✅ {name}{rate_str}"
             else:
                 _session_status[s["id"]] = "❌ не авторизован"
                 bad.append(s["id"])
@@ -537,6 +551,44 @@ async def daily_backup_reminder(bot: Bot):
             await asyncio.sleep(3600)
 
 
+async def daily_sub_reminder(bot: Bot):
+    """Уведомляет пользователей об истечении подписки за 3 дня и за 1 день."""
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            next_run = now.replace(hour=9, minute=0, second=0, microsecond=0)
+            if now >= next_run:
+                next_run += timedelta(days=1)
+            await asyncio.sleep((next_run - now).total_seconds())
+
+            today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            last_run = await db.get_setting("sub_reminder_last_run")
+            if last_run == today_key:
+                await asyncio.sleep(3600)
+                continue
+            await db.set_setting("sub_reminder_last_run", today_key)
+
+            for days_ahead in [3, 1]:
+                expiring = await db.get_expiring_subscriptions(days_ahead)
+                for user in expiring:
+                    try:
+                        days_text = "3 дня" if days_ahead == 3 else "1 день"
+                        await bot.send_message(
+                            user["user_id"],
+                            f"⚠️ <b>Подписка истекает через {days_text}!</b>\n\n"
+                            f"📅 Дата окончания: {str(user['subscription_end'])[:10]}\n\n"
+                            f"Продлите подписку, чтобы не потерять доступ к функциям бота.",
+                            parse_mode="HTML",
+                            reply_markup=await _buy_keyboard()
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.05)
+        except Exception as e:
+            logger.error(f"daily_sub_reminder: {e}")
+            await asyncio.sleep(3600)
+
+
 # ─── /start ────────────────────────────────────────────────
 
 @router.message(Command("start"))
@@ -557,6 +609,19 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
             # Только записываем реферала. Бонус (+1 день) выдаётся обоим
             # при первой оплате реферала минимум на 1 день (в poll_payments).
             await db.add_referral(referrer["user_id"], u.id, REFERRAL_BONUS_DAYS)
+
+    # Капча для новых пользователей
+    if u.id not in SUPERADMIN_IDS and not await db.is_admin(u.id):
+        if not await db.has_captcha_confirmed(u.id):
+            await message.answer(
+                f"👋 Привет, <b>{u.first_name}</b>!\n\n"
+                f"Для продолжения подтвердите, что вы не бот:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Я не бот, продолжить", callback_data="captcha:confirm")]
+                ])
+            )
+            return
 
     is_adm = await db.is_admin(u.id) or u.id in SUPERADMIN_IDS
     has_sub = is_adm or await db.has_active_subscription(u.id)
@@ -890,6 +955,12 @@ async def _buy_keyboard() -> InlineKeyboardMarkup:
         days_str = '♾️ Навсегда' if p['days'] == 0 else f"📅 {p['days']} дней"
         label = f"{days_str} — {p['price']:.0f} USD"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"buy:{p['days']}:{p['price']}")])
+        sp = p.get("stars_price", 0) or 0
+        if sp > 0:
+            rows.append([InlineKeyboardButton(
+                text=f"⭐ {days_str} — {sp} Stars",
+                callback_data=f"buy_stars:{p['id']}"
+            )])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -949,6 +1020,15 @@ async def btn_report(message: Message, bot: Bot, state: FSMContext):
     uid = message.from_user.id
     is_adm = await db.is_admin(uid) or uid in SUPERADMIN_IDS
     if not is_adm:
+        banned = await db.get_banned_user(uid)
+        if banned:
+            reason = banned.get("reason") or "нарушение правил"
+            await message.answer(
+                f"🚫 <b>Ваш аккаунт заблокирован.</b>\n\nПричина: {reason}\n\nОбратитесь к администратору.",
+                parse_mode="HTML"
+            ); return
+        if not await db.has_captcha_confirmed(uid):
+            await message.answer("⚠️ Нажмите /start для подтверждения."); return
         now = datetime.now(timezone.utc)
         last = user_last_report.get(uid)
         if last and (now - last).total_seconds() < REPORT_COOLDOWN_SECONDS:
@@ -996,6 +1076,13 @@ async def handle_forwarded_global(message: Message, bot: Bot, state: FSMContext)
 
     is_adm = await db.is_admin(uid) or uid in SUPERADMIN_IDS
     if not is_adm:
+        banned = await db.get_banned_user(uid)
+        if banned:
+            reason = banned.get("reason") or "нарушение правил"
+            await message.answer(
+                f"🚫 <b>Аккаунт заблокирован.</b>\nПричина: {reason}",
+                parse_mode="HTML"
+            ); return
         if not await db.has_active_subscription(uid):
             await message.answer("❌ Для подачи обращения нужна подписка.",
                                   reply_markup=await _buy_keyboard()); return
@@ -1577,6 +1664,7 @@ async def _send_peer_reports(bot: Bot, user_id: int, peer_username: str, peer_ty
     flood_wait = False
     for i, sess in enumerate(sessions, 1):
         client = None
+        _sess_ok = False
         try:
             client = TelegramClient(StringSession(sess["session_data"]), TELETHON_API_ID, TELETHON_API_HASH)
             await asyncio.wait_for(client.connect(), timeout=15.0)
@@ -1589,6 +1677,7 @@ async def _send_peer_reports(bot: Bot, user_id: int, peer_username: str, peer_ty
                         client(ReportPeerRequest(peer=peer, reason=reason_obj, message=custom_text)),
                         timeout=15.0)
                     success += 1
+                    _sess_ok = True
                 except FloodWaitError as e:
                     logger.warning(f"Peer-сессия {sess['id']} FloodWait {e.seconds}s")
                     flood_wait = True
@@ -1605,6 +1694,7 @@ async def _send_peer_reports(bot: Bot, user_id: int, peer_username: str, peer_ty
             if client:
                 try: await client.disconnect()
                 except Exception: pass
+        await db.increment_session_stats(sess["id"], 1 if _sess_ok else 0, 1)
         await asyncio.sleep(random.uniform(0.4, 0.8))
         spin = spinner[i % len(spinner)]
         try:
@@ -1681,6 +1771,7 @@ async def _send_reports(bot: Bot, user_id: int, chat_id_str: str, msg_id_str: st
     flood_wait = False
     for i, sess in enumerate(sessions, 1):
         client = None
+        _sess_ok = False
         try:
             client = TelegramClient(StringSession(sess["session_data"]), TELETHON_API_ID, TELETHON_API_HASH)
             await asyncio.wait_for(client.connect(), timeout=15.0)
@@ -1697,6 +1788,7 @@ async def _send_reports(bot: Bot, user_id: int, chat_id_str: str, msg_id_str: st
                                              reason=reason_obj, message=custom_text)),
                         timeout=15.0)
                     success += 1
+                    _sess_ok = True
                 except FloodWaitError as e:
                     logger.warning(f"Сессия {sess['id']} FloodWait {e.seconds}s")
                     flood_wait = True
@@ -1713,6 +1805,7 @@ async def _send_reports(bot: Bot, user_id: int, chat_id_str: str, msg_id_str: st
             if client:
                 try: await client.disconnect()
                 except Exception: pass
+        await db.increment_session_stats(sess["id"], 1 if _sess_ok else 0, 1)
         await asyncio.sleep(random.uniform(0.4, 0.8))
         spin = spinner[i % len(spinner)]
         try:
@@ -1812,7 +1905,7 @@ async def cb_sessions(call: CallbackQuery):
     await call.message.edit_text(
         f"📂 <b>Управление сессиями</b>\n\n"
         f"Активных сессий: <b>{n}</b>{sess_info}\n\n"
-        f"<b>Добавить сессию:</b> StringSession (строка) или авторизация по номеру телефона.",
+        f"<b>Добавить сессию:</b> StringSession, Auth Key (HEX) или авторизация по номеру телефона.",
         parse_mode="HTML",
         reply_markup=sessions_kb())
     await call.answer()
@@ -1880,6 +1973,186 @@ async def got_session_string(message: Message, state: FSMContext, bot: Bot):
             "Убедитесь что строка верная и попробуйте снова.",
             parse_mode="HTML"
         )
+
+
+# ─── Добавление сессии по Auth Key (HEX) ────────────────────
+
+_DC_SERVERS = {
+    1: ("149.154.175.53",  443),
+    2: ("149.154.167.51",  443),
+    3: ("149.154.175.100", 443),
+    4: ("149.154.167.91",  443),
+    5: ("91.108.56.130",   443),
+}
+
+
+@router.callback_query(F.data == "sess:authkey")
+async def cb_sess_authkey(call: CallbackQuery, state: FSMContext):
+    if not (await db.is_admin(call.from_user.id) or call.from_user.id in SUPERADMIN_IDS):
+        await call.answer("❌ Нет доступа", show_alert=True); return
+    await state.set_state(States.waiting_auth_key_hex)
+    await call.message.edit_text(
+        "🔑 <b>Добавление сессии по Auth Key (HEX)</b>\n\n"
+        "Вставьте Auth Key в формате HEX (512 символов, 256 байт).\n\n"
+        "Это авторизационный ключ аккаунта Telegram, который можно получить\n"
+        "из большинства клиентов (TDLib, MadelineProto, и др.).\n\n"
+        "/cancel — отмена",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data="admin:sessions")]
+        ])
+    )
+    await call.answer()
+
+
+@router.message(States.waiting_auth_key_hex)
+async def got_auth_key_hex(message: Message, state: FSMContext):
+    if not (await db.is_admin(message.from_user.id) or message.from_user.id in SUPERADMIN_IDS):
+        await state.clear(); return
+    if message.text and message.text.strip() == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено.", reply_markup=sessions_kb()); return
+
+    raw = (message.text or "").strip().lower()
+    if len(raw) != 512 or not all(c in "0123456789abcdef" for c in raw):
+        await message.answer(
+            "❌ <b>Неверный формат.</b>\n\n"
+            "Auth Key должен быть ровно 512 hex-символов (256 байт).\n"
+            "Попробуйте снова или /cancel.",
+            parse_mode="HTML"
+        )
+        return
+
+    await state.update_data(auth_key_hex=raw)
+    await state.set_state(States.waiting_auth_key_dc)
+    await message.answer(
+        "📡 <b>Введите номер DC-сервера (1–5)</b>\n\n"
+        "Укажите датацентр, к которому привязан аккаунт.\n"
+        "Если не знаете — попробуйте <b>2</b> (основной датацентр).\n\n"
+        "<code>DC1</code> — 149.154.175.53\n"
+        "<code>DC2</code> — 149.154.167.51\n"
+        "<code>DC3</code> — 149.154.175.100\n"
+        "<code>DC4</code> — 149.154.167.91\n"
+        "<code>DC5</code> — 91.108.56.130\n\n"
+        "/cancel — отмена",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="DC1", callback_data="authkey_dc:1"),
+                InlineKeyboardButton(text="DC2", callback_data="authkey_dc:2"),
+                InlineKeyboardButton(text="DC3", callback_data="authkey_dc:3"),
+                InlineKeyboardButton(text="DC4", callback_data="authkey_dc:4"),
+                InlineKeyboardButton(text="DC5", callback_data="authkey_dc:5"),
+            ],
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data="admin:sessions")],
+        ])
+    )
+
+
+async def _connect_authkey_session(auth_key_hex: str, dc_id: int, user_id: int) -> tuple:
+    """Создаёт сессию из Auth Key HEX, проверяет авторизацию и возвращает (sess_id, me) или бросает исключение."""
+    from telethon.crypto import AuthKey as TelethonAuthKey
+
+    ip, port = _DC_SERVERS[dc_id]
+    auth_key_bytes = bytes.fromhex(auth_key_hex)
+
+    session = MemorySession()
+    session.set_dc(dc_id, ip, port)
+    session.auth_key = TelethonAuthKey(data=auth_key_bytes)
+
+    client = TelegramClient(session, TELETHON_API_ID, TELETHON_API_HASH)
+    await client.connect()
+    try:
+        is_auth = await client.is_user_authorized()
+        if not is_auth:
+            raise ValueError("Аккаунт не авторизован с данным ключом.")
+        me = await client.get_me()
+        session_str = StringSession.save(client.session)
+        if not session_str:
+            raise ValueError("Не удалось получить StringSession из MemorySession.")
+    finally:
+        await client.disconnect()
+
+    sess_id = await db.add_session(session_str)
+    await db.log_admin_action(user_id, "add_session_authkey", f"id={sess_id} dc={dc_id} user={getattr(me, 'username', None) or getattr(me, 'id', '?')}")
+    return sess_id, me
+
+
+async def _handle_authkey_dc(dc_id: int, state: FSMContext, user_id: int, reply_fn):
+    """Общая логика подключения по DC для text- и callback-обработчиков."""
+    data = await state.get_data()
+    auth_key_hex = data.get("auth_key_hex")
+    if not auth_key_hex:
+        await state.clear()
+        await reply_fn("❌ Данные сессии потеряны. Начните заново.", reply_markup=sessions_kb())
+        return
+
+    status_msg = await reply_fn("🔄 Подключаюсь к DC{} и проверяю Auth Key...".format(dc_id))
+    try:
+        sess_id, me = await _connect_authkey_session(auth_key_hex, dc_id, user_id)
+        await state.clear()
+        name = f"{getattr(me, 'first_name', '') or ''} {getattr(me, 'last_name', '') or ''}".strip()
+        uname = getattr(me, 'username', None)
+        await status_msg.edit_text(
+            f"✅ <b>Сессия добавлена!</b>\n\n"
+            f"👤 Аккаунт: <code>{name}</code>\n"
+            f"📱 Username: @{uname or '—'}\n"
+            f"📡 DC: {dc_id}\n"
+            f"🆔 ID сессии: <code>{sess_id}</code>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await status_msg.edit_text(
+            f"❌ <b>Ошибка:</b> <code>{e}</code>\n\n"
+            "Проверьте Auth Key и номер DC. Попробуйте другой датацентр или /cancel.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="DC1", callback_data="authkey_dc:1"),
+                    InlineKeyboardButton(text="DC2", callback_data="authkey_dc:2"),
+                    InlineKeyboardButton(text="DC3", callback_data="authkey_dc:3"),
+                    InlineKeyboardButton(text="DC4", callback_data="authkey_dc:4"),
+                    InlineKeyboardButton(text="DC5", callback_data="authkey_dc:5"),
+                ],
+                [InlineKeyboardButton(text="◀️ Отмена", callback_data="admin:sessions")],
+            ])
+        )
+
+
+@router.callback_query(F.data.startswith("authkey_dc:"))
+async def cb_authkey_dc(call: CallbackQuery, state: FSMContext):
+    if not (await db.is_admin(call.from_user.id) or call.from_user.id in SUPERADMIN_IDS):
+        await call.answer("❌ Нет доступа", show_alert=True); return
+    current_state = await state.get_state()
+    if current_state != States.waiting_auth_key_dc:
+        await call.answer("❌ Сначала введите Auth Key.", show_alert=True); return
+    dc_id = int(call.data.split(":")[1])
+    await call.answer()
+
+    async def reply_fn(text, **kwargs):
+        return await call.message.answer(text, **kwargs)
+
+    await _handle_authkey_dc(dc_id, state, call.from_user.id, reply_fn)
+
+
+@router.message(States.waiting_auth_key_dc)
+async def got_auth_key_dc(message: Message, state: FSMContext):
+    if not (await db.is_admin(message.from_user.id) or message.from_user.id in SUPERADMIN_IDS):
+        await state.clear(); return
+    if message.text and message.text.strip() == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено.", reply_markup=sessions_kb()); return
+
+    text = (message.text or "").strip()
+    if not text.isdigit() or int(text) not in _DC_SERVERS:
+        await message.answer("❌ Введите номер датацентра от 1 до 5."); return
+
+    dc_id = int(text)
+
+    async def reply_fn(text, **kwargs):
+        return await message.answer(text, **kwargs)
+
+    await _handle_authkey_dc(dc_id, state, message.from_user.id, reply_fn)
 
 
 # ─── Авторизация по номеру телефона ─────────────────────────
@@ -2095,8 +2368,11 @@ async def cb_sess_check(call: CallbackQuery):
             if ok:
                 me = await asyncio.wait_for(client.get_me(), timeout=10.0)
                 name = f"@{me.username}" if me.username else str(me.id)
-                _session_status[sess["id"]] = f"✅ {name}"
-                results.append(f"✅ #{sess['id']} — {name}")
+                sp = int(sess.get("success_reports", 0) or 0)
+                tp = int(sess.get("total_reports", 0) or 0)
+                rate_str = f" ({round(sp/tp*100)}%)" if tp > 0 else ""
+                _session_status[sess["id"]] = f"✅ {name}{rate_str}"
+                results.append(f"✅ #{sess['id']} — {name}{rate_str}")
             else:
                 _session_status[sess["id"]] = "❌ не авторизован"
                 results.append(f"❌ #{sess['id']} — не авторизован")
@@ -3031,6 +3307,378 @@ async def cb_admin_stats(call: CallbackQuery):
             [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")]]))
 
 
+# ─── Капча ─────────────────────────────────────────────────
+
+@router.callback_query(F.data == "captcha:confirm")
+async def cb_captcha_confirm(call: CallbackQuery, bot: Bot):
+    uid = call.from_user.id
+    await db.set_captcha_confirmed(uid)
+    is_adm = await db.is_admin(uid) or uid in SUPERADMIN_IDS
+    has_sub = is_adm or await db.has_active_subscription(uid)
+    has_prem = is_adm or await db.has_active_premium(uid)
+    not_ch = [] if is_adm else await check_channels(bot, uid)
+
+    if is_adm:
+        status_line = "👑 <b>Администратор</b> — доступ неограничен"
+    elif has_sub and has_prem:
+        status_line = "✅ <b>Подписка активна</b>  •  💎 <b>Premium</b>"
+    elif has_sub:
+        status_line = "✅ <b>Подписка активна</b>"
+    else:
+        status_line = "⚠️ <b>Нет подписки</b> — нажмите 💎 Купить подписку"
+
+    ch_text = ""
+    if not_ch:
+        ch_text = "\n\n📢 <b>Подпишитесь на каналы:</b>\n" + "\n".join(f"• @{c['channel_username']}" for c in not_ch)
+
+    await call.message.edit_text(
+        f"✅ <b>Проверка пройдена!</b>\n\n"
+        f"👋 Добро пожаловать, <b>{call.from_user.first_name}</b>!\n\n"
+        f"{status_line}{ch_text}",
+        parse_mode="HTML"
+    )
+    await call.message.answer(
+        "📨 Главное меню:",
+        reply_markup=await get_main_keyboard(uid, is_adm)
+    )
+    await call.answer()
+
+
+# ─── Чёрный список (админ) ─────────────────────────────────
+
+@router.callback_query(F.data == "admin:banned")
+async def cb_admin_banned(call: CallbackQuery):
+    if not (await db.is_admin(call.from_user.id) or call.from_user.id in SUPERADMIN_IDS):
+        await call.answer("❌ Нет доступа", show_alert=True); return
+    banned = await db.get_all_banned()
+    if banned:
+        lines = []
+        for b in banned[:20]:
+            reason = b.get("reason") or "—"
+            lines.append(f"• <code>{b['user_id']}</code> — {reason}")
+        text = "🚫 <b>Чёрный список</b>\n\n" + "\n".join(lines)
+    else:
+        text = "🚫 <b>Чёрный список пуст</b>"
+    await call.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🚫 Забанить",   callback_data="admin:ban_user"),
+             InlineKeyboardButton(text="✅ Разбанить",  callback_data="admin:unban_user")],
+            [InlineKeyboardButton(text="◀️ Назад",      callback_data="admin:back")],
+        ])
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "admin:ban_user")
+async def cb_ban_user_start(call: CallbackQuery, state: FSMContext):
+    if not (await db.is_admin(call.from_user.id) or call.from_user.id in SUPERADMIN_IDS):
+        await call.answer("❌ Нет доступа", show_alert=True); return
+    await state.set_state(States.waiting_ban_uid)
+    await call.message.edit_text(
+        "🚫 <b>Забанить пользователя</b>\n\nВведите user_id пользователя:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data="admin:banned")]
+        ])
+    )
+    await call.answer()
+
+
+@router.message(States.waiting_ban_uid)
+async def got_ban_uid(message: Message, state: FSMContext):
+    if not (await db.is_admin(message.from_user.id) or message.from_user.id in SUPERADMIN_IDS):
+        await state.clear(); return
+    if message.text and message.text.strip() == "/cancel":
+        await state.clear(); await message.answer("❌ Отменено."); return
+    text = (message.text or "").strip()
+    if not text.lstrip("-").isdigit():
+        await message.answer("❌ Введите числовой user_id:"); return
+    await state.update_data(ban_uid=int(text))
+    await state.set_state(States.waiting_ban_reason)
+    await message.answer("📝 Введите причину бана (или /skip чтобы оставить пустой):")
+
+
+@router.message(States.waiting_ban_reason)
+async def got_ban_reason(message: Message, state: FSMContext):
+    if not (await db.is_admin(message.from_user.id) or message.from_user.id in SUPERADMIN_IDS):
+        await state.clear(); return
+    data = await state.get_data()
+    uid = data.get("ban_uid")
+    reason = "" if (message.text or "").strip() == "/skip" else (message.text or "").strip()
+    await db.ban_user(uid, reason, message.from_user.id)
+    await db.log_admin_action(message.from_user.id, "ban_user", f"uid={uid} reason={reason}")
+    await state.clear()
+    await message.answer(
+        f"✅ Пользователь <code>{uid}</code> заблокирован.\nПричина: {reason or '—'}",
+        parse_mode="HTML",
+        reply_markup=admin_kb(message.from_user.id in SUPERADMIN_IDS)
+    )
+
+
+@router.callback_query(F.data == "admin:unban_user")
+async def cb_unban_user_start(call: CallbackQuery, state: FSMContext):
+    if not (await db.is_admin(call.from_user.id) or call.from_user.id in SUPERADMIN_IDS):
+        await call.answer("❌ Нет доступа", show_alert=True); return
+    await state.set_state(States.waiting_unban_uid)
+    await call.message.edit_text(
+        "✅ <b>Разбанить пользователя</b>\n\nВведите user_id:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data="admin:banned")]
+        ])
+    )
+    await call.answer()
+
+
+@router.message(States.waiting_unban_uid)
+async def got_unban_uid(message: Message, state: FSMContext):
+    if not (await db.is_admin(message.from_user.id) or message.from_user.id in SUPERADMIN_IDS):
+        await state.clear(); return
+    if message.text and message.text.strip() == "/cancel":
+        await state.clear(); await message.answer("❌ Отменено."); return
+    text = (message.text or "").strip()
+    if not text.lstrip("-").isdigit():
+        await message.answer("❌ Введите числовой user_id:"); return
+    uid = int(text)
+    banned = await db.get_banned_user(uid)
+    if not banned:
+        await message.answer(f"⚠️ Пользователь <code>{uid}</code> не в чёрном списке.", parse_mode="HTML")
+        await state.clear(); return
+    await db.unban_user(uid)
+    await db.log_admin_action(message.from_user.id, "unban_user", f"uid={uid}")
+    await state.clear()
+    await message.answer(
+        f"✅ Пользователь <code>{uid}</code> разбанен.",
+        parse_mode="HTML",
+        reply_markup=admin_kb(message.from_user.id in SUPERADMIN_IDS)
+    )
+
+
+# ─── Stars тарифы (админ) ─────────────────────────────────
+
+@router.callback_query(F.data == "admin:stars")
+async def cb_admin_stars(call: CallbackQuery):
+    if not (await db.is_admin(call.from_user.id) or call.from_user.id in SUPERADMIN_IDS):
+        await call.answer("❌ Нет доступа", show_alert=True); return
+    plans = await db.get_subscription_plans()
+    lines = []
+    buttons = []
+    for p in plans:
+        sp = p.get("stars_price", 0) or 0
+        sp_str = f"{sp} ⭐" if sp > 0 else "отключено"
+        lines.append(f"• {p['label']} — {sp_str}")
+        buttons.append([InlineKeyboardButton(
+            text=f"✏️ {p['label']}",
+            callback_data=f"stars_set_plan:{p['id']}"
+        )])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")])
+    await call.message.edit_text(
+        "⭐ <b>Stars тарифы</b>\n\n"
+        "Цена 0 = кнопка Stars не показывается пользователям.\n\n"
+        + ("\n".join(lines) if lines else "Нет тарифов"),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("stars_set_plan:"))
+async def cb_stars_set_plan(call: CallbackQuery, state: FSMContext):
+    if not (await db.is_admin(call.from_user.id) or call.from_user.id in SUPERADMIN_IDS):
+        await call.answer("❌ Нет доступа", show_alert=True); return
+    plan_id = int(call.data.split(":")[1])
+    plans = await db.get_subscription_plans()
+    plan = next((p for p in plans if p["id"] == plan_id), None)
+    if not plan:
+        await call.answer("❌ Тариф не найден", show_alert=True); return
+    current = plan.get("stars_price", 0) or 0
+    await state.update_data(stars_plan_id=plan_id)
+    await state.set_state(States.waiting_stars_price)
+    await call.message.edit_text(
+        f"⭐ <b>Stars цена: {plan['label']}</b>\n\n"
+        f"Текущая цена: <b>{current} ⭐</b>\n\n"
+        f"Введите новую цену в Stars (целое число, 0 — отключить):\n\n"
+        f"/cancel — отмена",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data="admin:stars")]
+        ])
+    )
+    await call.answer()
+
+
+@router.message(States.waiting_stars_price)
+async def got_stars_price(message: Message, state: FSMContext):
+    if not (await db.is_admin(message.from_user.id) or message.from_user.id in SUPERADMIN_IDS):
+        await state.clear(); return
+    if message.text and message.text.strip() == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено.", reply_markup=admin_kb(message.from_user.id in SUPERADMIN_IDS)); return
+    text = (message.text or "").strip()
+    if not text.isdigit():
+        await message.answer("❌ Введите целое неотрицательное число:"); return
+    data = await state.get_data()
+    plan_id = data.get("stars_plan_id")
+    stars_price = int(text)
+    await db.update_plan_stars_price(plan_id, stars_price)
+    await db.log_admin_action(message.from_user.id, "set_stars_price", f"plan={plan_id} stars={stars_price}")
+    await state.clear()
+    status = f"{stars_price} ⭐" if stars_price > 0 else "отключено"
+    await message.answer(
+        f"✅ Stars цена обновлена: <b>{status}</b>",
+        parse_mode="HTML",
+        reply_markup=admin_kb(message.from_user.id in SUPERADMIN_IDS)
+    )
+
+
+# ─── Stars оплата ─────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("buy_stars:"))
+async def cb_buy_stars(call: CallbackQuery, bot: Bot):
+    plan_id = int(call.data.split(":")[1])
+    plans = await db.get_subscription_plans()
+    plan = next((p for p in plans if p["id"] == plan_id), None)
+    if not plan:
+        await call.answer("❌ Тариф не найден", show_alert=True); return
+    stars_price = plan.get("stars_price", 0) or 0
+    if stars_price <= 0:
+        await call.answer("❌ Stars оплата для этого тарифа не настроена.", show_alert=True); return
+    days = plan["days"]
+    label = "навсегда" if days == 0 else f"{days} дней"
+    title = f"Подписка {'навсегда' if days == 0 else f'на {days} дней'}"
+    await call.answer()
+    await bot.send_invoice(
+        chat_id=call.from_user.id,
+        title=title,
+        description=f"Подписка на сервис верификации — {label}",
+        payload=f"stars:{call.from_user.id}:{plan_id}:{days}",
+        currency="XTR",
+        prices=[LabeledPrice(label=title, amount=stars_price)]
+    )
+
+
+@router.pre_checkout_query()
+async def pre_checkout_handler(query: PreCheckoutQuery):
+    await query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def successful_payment_handler(message: Message, bot: Bot):
+    payload = message.successful_payment.invoice_payload
+    parts = payload.split(":")
+    if parts[0] != "stars" or len(parts) < 4:
+        return
+    user_id = int(parts[1])
+    plan_id = int(parts[2])
+    days = int(parts[3])
+    await db.activate_subscription(user_id, days)
+    label = "навсегда" if days == 0 else f"{days} дней"
+    is_adm = await db.is_admin(user_id) or user_id in SUPERADMIN_IDS
+    await message.answer(
+        f"✅ <b>Оплата Stars прошла!</b>\n\n"
+        f"🎉 Подписка активирована: <b>{label}</b>.",
+        parse_mode="HTML",
+        reply_markup=await get_main_keyboard(user_id, is_adm)
+    )
+    await db.log_admin_action(0, "stars_payment", f"user={user_id} days={days} plan={plan_id}")
+    if days >= 1:
+        referrer_id = await db.get_referrer_for_payment_bonus(user_id)
+        if referrer_id:
+            await db.mark_referral_bonus_given(user_id)
+            await db.grant_subscription(user_id, REFERRAL_BONUS_DAYS)
+            await db.grant_subscription(referrer_id, REFERRAL_BONUS_DAYS)
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    f"🎉 <b>+{REFERRAL_BONUS_DAYS} день подписки!</b>\nВаш реферал оплатил подписку.",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+
+
+# ─── Реферальный лидерборд (админ) ─────────────────────────
+
+@router.callback_query(F.data == "admin:ref_leaderboard")
+async def cb_ref_leaderboard(call: CallbackQuery):
+    if not (await db.is_admin(call.from_user.id) or call.from_user.id in SUPERADMIN_IDS):
+        await call.answer("❌ Нет доступа", show_alert=True); return
+    top = await db.get_referral_leaderboard(10)
+    if not top:
+        await call.message.edit_text(
+            "🏆 <b>Топ рефереров</b>\n\nПока нет данных.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")]
+            ])
+        )
+        await call.answer(); return
+
+    medals = ["🥇", "🥈", "🥉"] + ["▪️"] * 10
+    lines = []
+    for i, r in enumerate(top):
+        uname = f"@{r['username']}" if r.get("username") else f"id:{r['referrer_id']}"
+        name = r.get("first_name") or ""
+        lines.append(f"{medals[i]} {uname} {name} — <b>{r['ref_count']}</b> рефералов")
+
+    await call.message.edit_text(
+        "🏆 <b>Топ рефереров</b>\n\n"
+        + "\n".join(lines) + "\n\n"
+        + "🥇 +10 дней  •  🥈 +5 дней  •  🥉 +2 дня",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎁 Наградить топ-3", callback_data="admin:reward_top3")],
+            [InlineKeyboardButton(text="🔄 Обновить",        callback_data="admin:ref_leaderboard")],
+            [InlineKeyboardButton(text="◀️ Назад",           callback_data="admin:back")],
+        ])
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "admin:reward_top3")
+async def cb_reward_top3(call: CallbackQuery, bot: Bot):
+    if not (await db.is_admin(call.from_user.id) or call.from_user.id in SUPERADMIN_IDS):
+        await call.answer("❌ Нет доступа", show_alert=True); return
+    top = await db.get_referral_leaderboard(3)
+    if not top:
+        await call.answer("⚠️ Нет данных для награждения", show_alert=True); return
+
+    rewards = [10, 5, 2]
+    medals = ["🥇", "🥈", "🥉"]
+    results = []
+
+    for i, r in enumerate(top[:3]):
+        uid = r["referrer_id"]
+        days = rewards[i]
+        try:
+            await db.grant_subscription(uid, days)
+            results.append(f"{medals[i]} <code>{uid}</code> +{days} дн.")
+            await db.log_admin_action(call.from_user.id, "reward_referrer", f"uid={uid} days={days} place={i+1}")
+            try:
+                await bot.send_message(
+                    uid,
+                    f"{medals[i]} <b>Поздравляем!</b>\n\n"
+                    f"Вы заняли <b>{i+1} место</b> в реферальном рейтинге!\n"
+                    f"🎁 <b>+{days} дней</b> подписки в подарок!",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            results.append(f"{medals[i]} <code>{uid}</code> — ошибка: {e}")
+
+    await call.message.edit_text(
+        "🎁 <b>Топ-3 награждены!</b>\n\n" + "\n".join(results),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ К лидерборду", callback_data="admin:ref_leaderboard")]
+        ])
+    )
+    await call.answer()
+
+
 # ─── Запуск ────────────────────────────────────────────────
 
 async def main():
@@ -3041,9 +3689,10 @@ async def main():
     asyncio.create_task(poll_payments(bot))
     asyncio.create_task(hourly_session_check(bot))
     asyncio.create_task(daily_backup_reminder(bot))
+    asyncio.create_task(daily_sub_reminder(bot))
     asyncio.create_task(startup_session_check(bot))
     logger.info("Бот запущен ✅")
-    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+    await dp.start_polling(bot, allowed_updates=["message", "callback_query", "pre_checkout_query"])
 
 
 if __name__ == "__main__":
